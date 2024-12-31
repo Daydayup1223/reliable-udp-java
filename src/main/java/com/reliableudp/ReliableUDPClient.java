@@ -51,31 +51,40 @@ public class ReliableUDPClient {
 
     private class RetransmissionTask {
         private final Packet packet;
-        private ScheduledFuture<?> future;
-        private int retries;
+        private volatile ScheduledFuture<?> future;
+        private volatile int retries;
         private final long sendTime;
-        private boolean isRetransmission;
+        private volatile boolean isRetransmission;
+        private volatile boolean isCancelled;
 
         public RetransmissionTask(Packet packet) {
             this.packet = packet;
             this.retries = 0;
             this.sendTime = System.currentTimeMillis();
             this.isRetransmission = false;
+            this.isCancelled = false;
         }
 
-        public void cancel() {
-            if (future != null) {
-                future.cancel(false);
+        public synchronized void cancel() {
+            if (!isCancelled) {
+                isCancelled = true;
+                if (future != null) {
+                    future.cancel(false);
+                }
             }
         }
 
-        public void scheduleRetransmission() {
+        public synchronized void scheduleRetransmission() {
+            if (isCancelled) {
+                return;
+            }
+
             // 使用当前的 RTO 值
             long timeout = calculateRTO();
             
             // 指数退避
             if (isRetransmission) {
-                timeout *= (1 << Math.min(retries, 5)); // 最多左移5位，避免溢出
+                timeout *= (1 << Math.min(retries, 5));
             }
             
             // 确保超时在合理范围内
@@ -85,18 +94,22 @@ public class ReliableUDPClient {
                              "，超时: " + timeout + "ms，重试次数: " + retries);
             
             future = scheduler.schedule(() -> {
-                if (retries < MAX_RETRIES) {
+                if (!isCancelled && retries < MAX_RETRIES) {
                     try {
-                        retries++;
-                        isRetransmission = true;
-                        sendPacket(packet, serverAddress, serverPort);
-                        System.out.println("重传数据包，序号: " + packet.getSeqNum() + 
-                                         "，第 " + retries + " 次重试");
-                        scheduleRetransmission(); // 安排下一次重传
+                        synchronized (this) {
+                            if (!isCancelled) {
+                                retries++;
+                                isRetransmission = true;
+                                sendPacket(packet, serverAddress, serverPort);
+                                System.out.println("重传数据包，序号: " + packet.getSeqNum() + 
+                                                 "，第 " + retries + " 次重试");
+                                scheduleRetransmission();
+                            }
+                        }
                     } catch (IOException e) {
                         e.printStackTrace();
                     }
-                } else {
+                } else if (!isCancelled) {
                     System.out.println("数据包重传次数超过限制，序号: " + packet.getSeqNum());
                     connectionLost();
                 }
@@ -255,18 +268,32 @@ public class ReliableUDPClient {
     private void handleAck(Packet packet) {
         int ackNum = packet.getSeqNum();
         
-        // 取消已确认包的重传
-        RetransmissionTask task = pendingPackets.remove(ackNum);
-        if (task != null) {
-            // 取消重传定时器
-            task.cancel();
-            
-            // 更新 RTT 估计值
-            updateRTT(ackNum, task.sendTime);
-            
-            System.out.println("收到ACK，序号: " + ackNum + "，当前 RTO: " + 
-                             calculateRTO() + "ms");
+        // 找出所有需要取消的重传任务
+        List<Integer> toRemove = new ArrayList<>();
+        for (Map.Entry<Integer, RetransmissionTask> entry : pendingPackets.entrySet()) {
+            if (entry.getKey() <= ackNum) {
+                toRemove.add(entry.getKey());
+            }
         }
+        
+        // 取消并移除重传任务
+        for (Integer seqNum : toRemove) {
+            RetransmissionTask task = pendingPackets.remove(seqNum);
+            if (task != null) {
+                task.cancel();
+                
+                // 更新 RTT 估计值（只对非重传包）
+                if (!task.isRetransmission) {
+                    updateRTT(seqNum, task.sendTime);
+                }
+                
+                System.out.println("确认数据包，序号: " + seqNum + "，当前 RTO: " + 
+                                 calculateRTO() + "ms");
+            }
+        }
+        
+        // 更新接收窗口大小
+        updateReceiverWindow(packet.getWindowSize());
     }
 
     private void handleWindowUpdate(Packet packet) {
@@ -291,13 +318,11 @@ public class ReliableUDPClient {
 
     private void waitForWindow() throws InterruptedException {
         synchronized (windowLock) {
-            while (receiverWindow <= 0) {
+            while (receiverWindow <= 0 && !windowUpdateReceived) {
                 System.out.println("等待接收窗口...");
-                windowLock.wait(1000);  // 最多等待1秒
-                if (!running) {
-                    throw new InterruptedException("连接已关闭");
-                }
+                windowLock.wait(calculateRTO());
             }
+            windowUpdateReceived = false;
         }
     }
 
@@ -447,6 +472,20 @@ public class ReliableUDPClient {
     private volatile int receiverWindow = 16;  // 初始接收窗口大小
     private final Object windowLock = new Object();
     private volatile boolean windowUpdateReceived = false;
+
+    /**
+     * 更新接收窗口大小
+     */
+    private synchronized void updateReceiverWindow(int newSize) {
+        synchronized (windowLock) {
+            if (newSize != receiverWindow) {
+                System.out.println("更新接收窗口大小: " + newSize);
+                receiverWindow = newSize;
+                windowUpdateReceived = true;
+                windowLock.notifyAll();
+            }
+        }
+    }
 
     private void connectionLost() {
         System.out.println("检测到连接丢失");
