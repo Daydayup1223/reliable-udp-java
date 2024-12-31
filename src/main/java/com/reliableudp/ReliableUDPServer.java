@@ -12,14 +12,21 @@ public class ReliableUDPServer {
     private static final int INIT_TIMEOUT = 1000; // Initial timeout 1 second
     private static final int MAX_TIMEOUT = 8000; // Maximum timeout 8 seconds
     private static final int MAX_RETRIES = 5;
-    
+    private static final int RECEIVE_WINDOW_SIZE = 16; // 接收窗口大小
+
     private final int port;
     private DatagramSocket socket;
-    private final Map<String, ConnectionState> connectionStates = new ConcurrentHashMap<>();
-    private final Map<String, Integer> expectedSeqNums = new ConcurrentHashMap<>();
-    private final Map<String, StringBuilder> messageBuffers = new ConcurrentHashMap<>();
-    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
-    private volatile boolean running = true;
+    private volatile boolean running;
+    private final Map<String, ConnectionState> connectionStates;
+    private final Map<String, CircularBuffer> receiveBuffers;  // 每个客户端的接收缓冲区
+    private final ScheduledExecutorService scheduler;
+
+    public ReliableUDPServer(int port) {
+        this.port = port;
+        this.connectionStates = new ConcurrentHashMap<>();
+        this.receiveBuffers = new ConcurrentHashMap<>();
+        this.scheduler = Executors.newScheduledThreadPool(1);
+    }
 
     // TCP-like connection states
     public enum State {
@@ -77,13 +84,10 @@ public class ReliableUDPServer {
         }
     }
 
-    public ReliableUDPServer(int port) {
-        this.port = port;
-    }
-
     public void start() throws IOException {
         socket = new DatagramSocket(port);
         socket.setSoTimeout(100); // 使用较短的超时以便及时处理所有类型的包
+        running = true;
         System.out.println("服务器启动在端口: " + port);
 
         while (running) {
@@ -129,18 +133,17 @@ public class ReliableUDPServer {
                     System.out.println("收到ACK，连接建立");
                     stopRetransmission(state);
                     state.state = State.ESTABLISHED;
-                    expectedSeqNums.put(clientId, 0);
-                    messageBuffers.put(clientId, new StringBuilder());
+                    // 为新连接创建环形缓冲区
+                    receiveBuffers.put(clientId, new CircularBuffer(RECEIVE_WINDOW_SIZE));
                 }
                 break;
 
             case ESTABLISHED:
                 if (packet.getType() == Packet.TYPE_DATA) {
-                    handleDataPacket(packet, clientAddress, clientPort, clientId, state);
+                    handleDataPacket(packet, clientAddress, clientPort);
                 } else if (packet.getType() == Packet.TYPE_FIN) {
                     System.out.println("收到FIN包，发送ACK");
                     state.state = State.CLOSE_WAIT;
-                    // 直接发送ACK，不需要重传
                     sendPacket(new Packet(Packet.TYPE_ACK, packet.getSeqNum(), null, false), clientAddress, clientPort);
                     System.out.println("发送FIN包");
                     state.state = State.LAST_ACK;
@@ -193,35 +196,48 @@ public class ReliableUDPServer {
         }
     }
 
-    private void handleDataPacket(Packet packet, InetAddress clientAddress, int clientPort, String clientId, ConnectionState state) throws IOException {
-        int expectedSeqNum = expectedSeqNums.getOrDefault(clientId, 0);
-        System.out.println("收到数据包，序号: " + packet.getSeqNum() + ", 期望序号: " + expectedSeqNum);
+    /**
+     * 处理数据包
+     */
+    private void handleDataPacket(Packet packet, InetAddress clientAddress, int clientPort) throws IOException {
+        String clientId = clientAddress.getHostAddress() + ":" + clientPort;
+        CircularBuffer buffer = receiveBuffers.get(clientId);
+        if (buffer == null) {
+            System.out.println("错误：未找到客户端的接收缓冲区");
+            return;
+        }
+
+        int seqNum = packet.getSeqNum();
+        int result = buffer.put(seqNum, packet.getData());
         
-        if (packet.getSeqNum() == expectedSeqNum) {
-            // 处理按序到达的数据包
-            messageBuffers.get(clientId).append(new String(packet.getData()));
-            expectedSeqNums.put(clientId, expectedSeqNum + 1);
-            
-            // 发送ACK
-            Packet ackPacket = new Packet(Packet.TYPE_ACK, expectedSeqNum, null, false);
-            sendPacket(ackPacket, clientAddress, clientPort);
-            System.out.println("发送ACK，序号: " + expectedSeqNum);
-            
-            if (packet.isLast()) {
-                String message = messageBuffers.get(clientId).toString();
-                System.out.println("收到完整消息: " + message);
-                messageBuffers.get(clientId).setLength(0);
-            }
-        } else if (packet.getSeqNum() < expectedSeqNum) {
-            // 收到重复的数据包，重发ACK
-            System.out.println("收到重复数据包，重发ACK");
-            Packet ackPacket = new Packet(Packet.TYPE_ACK, packet.getSeqNum(), null, false);
-            sendPacket(ackPacket, clientAddress, clientPort);
-        } else {
-            // 收到乱序数据包，发送最后一个正确接收的序号的ACK
-            System.out.println("收到乱序数据包，发送上一个ACK");
-            Packet ackPacket = new Packet(Packet.TYPE_ACK, expectedSeqNum - 1, null, false);
-            sendPacket(ackPacket, clientAddress, clientPort);
+        switch (result) {
+            case 1: // 成功放入缓冲区
+                // 处理连续的数据包
+                buffer.processContiguous();
+                
+                // 发送ACK
+                sendAck(buffer.getNextSeq() - 1, buffer.getAvailableWindow(), clientAddress, clientPort);
+                
+                // 如果需要，发送窗口更新
+                if (buffer.needsWindowUpdate()) {
+                    System.out.println("发送窗口更新");
+                    sendAck(buffer.getNextSeq() - 1, buffer.getAvailableWindow(), clientAddress, clientPort);
+                }
+                
+                // 如果是最后一个包，打印完整消息
+                if (packet.isLast()) {
+                    String message = buffer.getAndClearMessage();
+                    System.out.println("收到完整消息: " + message);
+                }
+                break;
+                
+            case 0: // 重复的包，需要重发ACK
+                sendAck(buffer.getNextSeq() - 1, buffer.getAvailableWindow(), clientAddress, clientPort);
+                break;
+                
+            case -1: // 窗口外的包，发送当前窗口大小
+                sendAck(buffer.getNextSeq() - 1, buffer.getAvailableWindow(), clientAddress, clientPort);
+                break;
         }
     }
 
@@ -276,14 +292,18 @@ public class ReliableUDPServer {
         if (state != null) {
             state.cancelTimers();
         }
-        expectedSeqNums.remove(clientId);
-        messageBuffers.remove(clientId);
+        receiveBuffers.remove(clientId);  // 清理接收缓冲区
     }
 
     private void sendPacket(Packet packet, InetAddress address, int port) throws IOException {
         byte[] data = packet.toBytes();
         DatagramPacket datagramPacket = new DatagramPacket(data, data.length, address, port);
         socket.send(datagramPacket);
+    }
+
+    private void sendAck(int seqNum, int windowSize, InetAddress address, int port) throws IOException {
+        Packet packet = new Packet(Packet.TYPE_ACK, seqNum, null, false, windowSize);
+        sendPacket(packet, address, port);
     }
 
     public void stop() {

@@ -4,6 +4,8 @@ import java.io.IOException;
 import java.net.*;
 import java.util.Arrays;
 import java.util.concurrent.*;
+import java.util.List;
+import java.util.ArrayList;
 
 public class ReliableUDPClient {
     private static final int BUFFER_SIZE = 1024;
@@ -17,12 +19,12 @@ public class ReliableUDPClient {
     private DatagramSocket socket;
     private InetAddress serverAddress;
     private State state;
-    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+    private final ScheduledExecutorService scheduler;
     private RetransmissionTask currentRetransmissionTask;
     private ScheduledFuture<?> timeWaitTimer;
     private volatile boolean running;
     private final BlockingQueue<String> receivedMessages = new LinkedBlockingQueue<>();
-    private int nextSeqNum = 0;
+    private int nextSeqNum;
 
     // TCP-like connection states
     public enum State {
@@ -58,28 +60,59 @@ public class ReliableUDPClient {
         }
     }
 
-    public ReliableUDPClient(String serverHost, int serverPort) {
+    private volatile int receiverWindow = 16;  // 初始接收窗口大小
+    private final Object windowLock = new Object();
+    private volatile boolean windowUpdateReceived = false;
+
+    public ReliableUDPClient(String serverHost, int serverPort) throws UnknownHostException {
         this.serverHost = serverHost;
         this.serverPort = serverPort;
+        this.serverAddress = InetAddress.getByName(serverHost);
         this.state = State.CLOSED;
+        this.scheduler = Executors.newScheduledThreadPool(1);
+        this.nextSeqNum = 0;
     }
 
     public void connect() throws IOException {
         if (state != State.CLOSED) {
-            throw new IllegalStateException("Client must be in CLOSED state to connect");
+            throw new IOException("已经连接或正在连接");
         }
 
+        // 初始化连接
         socket = new DatagramSocket();
-        socket.setSoTimeout(100);
-        serverAddress = InetAddress.getByName(serverHost);
+        socket.setSoTimeout(100);  // 设置超时以便及时处理所有类型的包
         running = true;
-
-        // 发送SYN
-        System.out.println("发送SYN包");
         state = State.SYN_SENT;
-        startRetransmission(new Packet(Packet.TYPE_SYN, 0, null, false), serverAddress, serverPort);
 
         // 启动接收线程
+        startReceiveThread();
+
+        // 发送SYN包
+        System.out.println("发送SYN包");
+        startRetransmission(new Packet(Packet.TYPE_SYN, 0, null, false), serverAddress, serverPort);
+
+        // 等待连接建立
+        try {
+            long startTime = System.currentTimeMillis();
+            while (state != State.ESTABLISHED && System.currentTimeMillis() - startTime < 5000) {
+                Thread.sleep(100);
+                if (!running) {
+                    throw new IOException("连接失败");
+                }
+            }
+            if (state != State.ESTABLISHED) {
+                cleanup();
+                throw new IOException("连接超时");
+            }
+            System.out.println("连接已建立");
+        } catch (InterruptedException e) {
+            cleanup();
+            Thread.currentThread().interrupt();
+            throw new IOException("连接被中断");
+        }
+    }
+
+    private void startReceiveThread() {
         new Thread(this::receiveLoop).start();
     }
 
@@ -109,24 +142,21 @@ public class ReliableUDPClient {
                 if (packet.getType() == Packet.TYPE_SYN_ACK) {
                     System.out.println("收到SYN-ACK，发送ACK");
                     stopRetransmission();
-                    state = State.ESTABLISHED;
-                    sendPacket(new Packet(Packet.TYPE_ACK, 0, null, false), serverAddress, serverPort);
+                    try {
+                        sendPacket(new Packet(Packet.TYPE_ACK, 0, null, false), serverAddress, serverPort);
+                        state = State.ESTABLISHED;
+                        System.out.println("连接已建立");
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                    }
                 }
                 break;
 
             case ESTABLISHED:
                 if (packet.getType() == Packet.TYPE_ACK) {
-                    System.out.println("收到ACK: " + packet.getSeqNum());
-                    if (currentRetransmissionTask != null && 
-                        currentRetransmissionTask.packet.getSeqNum() == packet.getSeqNum()) {
-                        stopRetransmission();
-                    }
-                } else if (packet.getType() == Packet.TYPE_FIN) {
-                    System.out.println("收到FIN，发送ACK");
-                    state = State.CLOSE_WAIT;
-                    sendPacket(new Packet(Packet.TYPE_ACK, packet.getSeqNum(), null, false), serverAddress, serverPort);
-                    state = State.LAST_ACK;
-                    startRetransmission(new Packet(Packet.TYPE_FIN, 0, null, false), serverAddress, serverPort);
+                    handleAck(packet);
+                } else if (packet.getType() == Packet.TYPE_WINDOW_UPDATE) {
+                    handleWindowUpdate(packet);
                 }
                 break;
 
@@ -169,16 +199,107 @@ public class ReliableUDPClient {
         }
     }
 
-    public void send(String message) throws IOException {
+    private void handleAck(Packet packet) {
+        stopRetransmission();
+        updateWindow(packet.getWindowSize());
+        System.out.println("收到ACK，序号: " + packet.getSeqNum() + "，窗口大小: " + packet.getWindowSize());
+    }
+
+    private void handleWindowUpdate(Packet packet) {
+        updateWindow(packet.getWindowSize());
+        synchronized (windowLock) {
+            windowUpdateReceived = true;
+            windowLock.notifyAll();
+        }
+        System.out.println("收到窗口更新，新窗口大小: " + packet.getWindowSize());
+    }
+
+    private void updateWindow(int newWindow) {
+        if (newWindow >= 0) {
+            synchronized (windowLock) {
+                receiverWindow = newWindow;
+                if (receiverWindow > 0) {
+                    windowLock.notifyAll();
+                }
+            }
+        }
+    }
+
+    private void waitForWindow() throws InterruptedException {
+        synchronized (windowLock) {
+            while (receiverWindow <= 0) {
+                System.out.println("等待接收窗口...");
+                windowLock.wait(1000);  // 最多等待1秒
+                if (!running) {
+                    throw new InterruptedException("连接已关闭");
+                }
+            }
+        }
+    }
+
+    public void send(String message) throws IOException, InterruptedException {
         if (state != State.ESTABLISHED) {
             throw new IOException("连接未建立");
         }
 
         byte[] data = message.getBytes();
-        Packet packet = new Packet(Packet.TYPE_DATA, nextSeqNum, data, true);
-        System.out.println("发送数据包，序号: " + nextSeqNum);
-        startRetransmission(packet, serverAddress, serverPort);
-        nextSeqNum++;
+        waitForWindow();
+        synchronized (windowLock) {
+            if (receiverWindow > 0) {
+                receiverWindow--;
+                Packet packet = new Packet(Packet.TYPE_DATA, nextSeqNum++, data, true);
+                sendPacket(packet, serverAddress, serverPort);
+                System.out.println("发送数据包，序号: " + (nextSeqNum - 1) + "，剩余窗口: " + receiverWindow);
+            }
+        }
+    }
+
+    /**
+     * 模拟乱序发送数据包
+     * @param messages 要发送的消息列表
+     * @param delays 每个消息的延迟时间（毫秒）
+     * @throws IOException 如果发送失败
+     */
+    public void sendOutOfOrder(String[] messages, int[] delays) throws IOException, InterruptedException {
+        if (messages.length != delays.length) {
+            throw new IllegalArgumentException("消息数量必须等于延迟数量");
+        }
+
+        // 创建发送任务
+        List<ScheduledFuture<?>> futures = new ArrayList<>();
+        for (int i = 0; i < messages.length; i++) {
+            final int index = i;
+            final byte[] data = messages[i].getBytes();
+            boolean isLast = (i == messages.length - 1);
+
+            futures.add(scheduler.schedule(() -> {
+                try {
+                    // 等待有可用窗口
+                    waitForWindow();
+                    
+                    // 发送数据包
+                    synchronized (windowLock) {
+                        if (receiverWindow > 0) {
+                            receiverWindow--;
+                            Packet packet = new Packet(Packet.TYPE_DATA, index, data, isLast);
+                            sendPacket(packet, serverAddress, serverPort);
+                            System.out.println("发送数据包，序号: " + index + "，剩余窗口: " + receiverWindow);
+                        }
+                    }
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+            }, delays[i], TimeUnit.MILLISECONDS));
+        }
+
+        // 等待所有任务完成
+        for (ScheduledFuture<?> future : futures) {
+            try {
+                future.get();
+            } catch (ExecutionException e) {
+                e.printStackTrace();
+            }
+        }
     }
 
     private void startRetransmission(Packet packet, InetAddress address, int port) throws IOException {
