@@ -79,41 +79,47 @@ public class ReliableUDPClient {
                 return;
             }
 
-            // 使用当前的 RTO 值
+            // 计算本次重传超时
             long timeout = calculateRTO();
-            
-            // 指数退避
             if (isRetransmission) {
-                timeout *= (1 << Math.min(retries, 5));
+                // 使用二进制指数退避，但最多左移 5 位
+                timeout = Math.min(timeout * (1L << Math.min(retries, 5)), MAX_RTO);
             }
             
-            // 确保超时在合理范围内
-            timeout = Math.min(Math.max(timeout, MIN_RTO), MAX_RTO);
+            // 确保在合理范围内
+            timeout = Math.max(timeout, MIN_RTO);
             
-            System.out.println("计划重传数据包，序号: " + packet.getSeqNum() + 
-                             "，超时: " + timeout + "ms，重试次数: " + retries);
+            final long finalTimeout = timeout;
+            //System.out.println(String.format("计划重传数据包，序号: %d，超时: %dms，重试次数: %d",
+            //    packet.getSeqNum(), finalTimeout, retries));
             
             future = scheduler.schedule(() -> {
-                if (!isCancelled && retries < MAX_RETRIES) {
-                    try {
-                        synchronized (this) {
-                            if (!isCancelled) {
-                                retries++;
-                                isRetransmission = true;
-                                sendPacket(packet, serverAddress, serverPort);
-                                System.out.println("重传数据包，序号: " + packet.getSeqNum() + 
-                                                 "，第 " + retries + " 次重试");
-                                scheduleRetransmission();
-                            }
+                synchronized (RetransmissionTask.this) {
+                    if (!isCancelled && retries < MAX_RETRIES) {
+                        try {
+                            retries++;
+                            isRetransmission = true;
+                            sendPacket(packet, serverAddress, serverPort);
+                            System.out.println(String.format("重传数据包，序号: %d，第 %d 次重试，下次超时: %dms", 
+                                packet.getSeqNum(), retries, finalTimeout * (1L << Math.min(retries, 5))));
+                            scheduleRetransmission();
+                        } catch (IOException e) {
+                            e.printStackTrace();
                         }
-                    } catch (IOException e) {
-                        e.printStackTrace();
+                    } else if (!isCancelled) {
+                        System.out.println("数据包重传次数超过限制，序号: " + packet.getSeqNum());
+                        connectionLost();
                     }
-                } else if (!isCancelled) {
-                    System.out.println("数据包重传次数超过限制，序号: " + packet.getSeqNum());
-                    connectionLost();
                 }
             }, timeout, TimeUnit.MILLISECONDS);
+        }
+
+        public boolean isRetransmission() {
+            return isRetransmission;
+        }
+
+        public long getSendTime() {
+            return sendTime;
         }
     }
 
@@ -265,6 +271,9 @@ public class ReliableUDPClient {
         }
     }
 
+    /**
+     * 处理 ACK 包，使用累积确认
+     */
     private void handleAck(Packet packet) {
         int ackNum = packet.getSeqNum();
         
@@ -276,19 +285,25 @@ public class ReliableUDPClient {
             }
         }
         
-        // 取消并移除重传任务
-        for (Integer seqNum : toRemove) {
-            RetransmissionTask task = pendingPackets.remove(seqNum);
-            if (task != null) {
-                task.cancel();
-                
-                // 更新 RTT 估计值（只对非重传包）
-                if (!task.isRetransmission) {
-                    updateRTT(seqNum, task.sendTime);
+        // 批量处理确认
+        if (!toRemove.isEmpty()) {
+            int maxAcked = -1;
+            for (Integer seqNum : toRemove) {
+                RetransmissionTask task = pendingPackets.remove(seqNum);
+                if (task != null) {
+                    task.cancel();
+                    maxAcked = Math.max(maxAcked, seqNum);
+                    
+                    // 只对最大的非重传包更新 RTT
+                    if (!task.isRetransmission() && seqNum == maxAcked) {
+                        updateRTT(seqNum, task.getSendTime());
+                    }
                 }
-                
-                System.out.println("确认数据包，序号: " + seqNum + "，当前 RTO: " + 
-                                 calculateRTO() + "ms");
+            }
+            
+            if (maxAcked >= 0) {
+                System.out.println(String.format("批量确认到序号: %d，当前 RTO: %dms", 
+                    maxAcked, calculateRTO()));
             }
         }
         
@@ -344,21 +359,17 @@ public class ReliableUDPClient {
      * 更新 RTT 估计值（Karn/Partridge 算法）
      */
     private void updateRTT(int seqNum, long sendTime) {
-        RetransmissionTask task = pendingPackets.get(seqNum);
-        if (task != null && !task.isRetransmission) {
-            // 只对非重传包更新 RTT
-            long sampleRTT = System.currentTimeMillis() - sendTime;
-            
-            // 更新 SRTT: SRTT = (1-α)SRTT + α×SampleRTT
-            estimatedRTT = (1 - ALPHA) * estimatedRTT + ALPHA * sampleRTT;
-            
-            // 更新 RTTVAR: RTTVAR = (1-β)RTTVAR + β×|SampleRTT-SRTT|
-            devRTT = (1 - BETA) * devRTT + BETA * Math.abs(sampleRTT - estimatedRTT);
-            
-            System.out.println("更新 RTT - 样本: " + sampleRTT + "ms, SRTT: " + 
-                             String.format("%.2f", estimatedRTT) + "ms, RTTVAR: " + 
-                             String.format("%.2f", devRTT) + "ms");
-        }
+        // 计算样本 RTT
+        long sampleRTT = System.currentTimeMillis() - sendTime;
+        
+        // 更新 SRTT: SRTT = (1-α)SRTT + α×SampleRTT
+        estimatedRTT = (1 - ALPHA) * estimatedRTT + ALPHA * sampleRTT;
+        
+        // 更新 RTTVAR: RTTVAR = (1-β)RTTVAR + β×|SampleRTT-SRTT|
+        devRTT = (1 - BETA) * devRTT + BETA * Math.abs(sampleRTT - estimatedRTT);
+        
+        System.out.println(String.format("更新 RTT - 样本: %dms, SRTT: %.2fms, RTTVAR: %.2fms, 序号: %d", 
+            sampleRTT, estimatedRTT, devRTT, seqNum));
     }
 
     /**
@@ -366,7 +377,7 @@ public class ReliableUDPClient {
      * RTO = SRTT + 4×RTTVAR
      */
     private long calculateRTO() {
-        return (long)(estimatedRTT + 4 * devRTT);
+        return Math.min(Math.max((long)(estimatedRTT + 4 * devRTT), MIN_RTO), MAX_RTO);
     }
 
     /**
