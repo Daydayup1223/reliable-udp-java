@@ -6,13 +6,23 @@ import java.util.Arrays;
 import java.util.concurrent.*;
 import java.util.List;
 import java.util.ArrayList;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class ReliableUDPClient {
     private static final int BUFFER_SIZE = 1024;
     private static final long MSL = 2000; // Maximum Segment Lifetime (2 seconds)
     private static final int INIT_TIMEOUT = 1000; // Initial timeout 1 second
     private static final int MAX_TIMEOUT = 8000; // Maximum timeout 8 seconds
-    private static final int MAX_RETRIES = 5;
+    private static final int MAX_RETRIES = 12;      // 最大重传次数
+    private static final int RETRANSMISSION_TIMEOUT = 1000; // 1秒超时
+
+    // RTT 相关常量
+    private static final int INITIAL_RTO = 1000;    // 初始 RTO 为 1秒
+    private static final int MIN_RTO = 200;         // 最小 RTO 为 200ms
+    private static final int MAX_RTO = 60000;       // 最大 RTO 为 60秒
+    private static final double ALPHA = 0.125;      // SRTT 更新权重
+    private static final double BETA = 0.25;        // RTTVAR 更新权重
 
     private final String serverHost;
     private final int serverPort;
@@ -39,30 +49,65 @@ public class ReliableUDPClient {
         LAST_ACK
     }
 
-    private static class RetransmissionTask {
+    private class RetransmissionTask {
         private final Packet packet;
-        private final InetAddress address;
-        private final int port;
-        private int retries;
-        private int currentTimeout;
         private ScheduledFuture<?> future;
+        private int retries;
+        private final long sendTime;
+        private boolean isRetransmission;
 
-        RetransmissionTask(Packet packet, InetAddress address, int port) {
+        public RetransmissionTask(Packet packet) {
             this.packet = packet;
-            this.address = address;
-            this.port = port;
             this.retries = 0;
-            this.currentTimeout = INIT_TIMEOUT;
+            this.sendTime = System.currentTimeMillis();
+            this.isRetransmission = false;
         }
 
-        void incrementTimeout() {
-            currentTimeout = Math.min(currentTimeout * 2, MAX_TIMEOUT);
+        public void cancel() {
+            if (future != null) {
+                future.cancel(false);
+            }
+        }
+
+        public void scheduleRetransmission() {
+            // 使用当前的 RTO 值
+            long timeout = calculateRTO();
+            
+            // 指数退避
+            if (isRetransmission) {
+                timeout *= (1 << Math.min(retries, 5)); // 最多左移5位，避免溢出
+            }
+            
+            // 确保超时在合理范围内
+            timeout = Math.min(Math.max(timeout, MIN_RTO), MAX_RTO);
+            
+            System.out.println("计划重传数据包，序号: " + packet.getSeqNum() + 
+                             "，超时: " + timeout + "ms，重试次数: " + retries);
+            
+            future = scheduler.schedule(() -> {
+                if (retries < MAX_RETRIES) {
+                    try {
+                        retries++;
+                        isRetransmission = true;
+                        sendPacket(packet, serverAddress, serverPort);
+                        System.out.println("重传数据包，序号: " + packet.getSeqNum() + 
+                                         "，第 " + retries + " 次重试");
+                        scheduleRetransmission(); // 安排下一次重传
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                    }
+                } else {
+                    System.out.println("数据包重传次数超过限制，序号: " + packet.getSeqNum());
+                    connectionLost();
+                }
+            }, timeout, TimeUnit.MILLISECONDS);
         }
     }
 
-    private volatile int receiverWindow = 16;  // 初始接收窗口大小
-    private final Object windowLock = new Object();
-    private volatile boolean windowUpdateReceived = false;
+    // RTT 估计值
+    private double estimatedRTT = INITIAL_RTO;  // SRTT (Smoothed RTT)
+    private double devRTT = INITIAL_RTO / 2.0;  // RTTVAR (RTT Variation)
+    private final Map<Integer, RetransmissionTask> pendingPackets = new ConcurrentHashMap<>();
 
     public ReliableUDPClient(String serverHost, int serverPort) throws UnknownHostException {
         this.serverHost = serverHost;
@@ -89,7 +134,8 @@ public class ReliableUDPClient {
 
         // 发送SYN包
         System.out.println("发送SYN包");
-        startRetransmission(new Packet(Packet.TYPE_SYN, 0, null, false), serverAddress, serverPort);
+        Packet packet = new Packet(Packet.TYPE_SYN, 0, null, false);
+        sendWithRetransmission(packet);
 
         // 等待连接建立
         try {
@@ -141,14 +187,10 @@ public class ReliableUDPClient {
             case SYN_SENT:
                 if (packet.getType() == Packet.TYPE_SYN_ACK) {
                     System.out.println("收到SYN-ACK，发送ACK");
-                    stopRetransmission();
-                    try {
-                        sendPacket(new Packet(Packet.TYPE_ACK, 0, null, false), serverAddress, serverPort);
-                        state = State.ESTABLISHED;
-                        System.out.println("连接已建立");
-                    } catch (IOException e) {
-                        e.printStackTrace();
-                    }
+                    Packet ackPacket = new Packet(Packet.TYPE_ACK, 0, null, false);
+                    sendWithRetransmission(ackPacket);
+                    state = State.ESTABLISHED;
+                    System.out.println("连接已建立");
                 }
                 break;
 
@@ -163,18 +205,23 @@ public class ReliableUDPClient {
             case FIN_WAIT1:
                 if (packet.getType() == Packet.TYPE_ACK) {
                     System.out.println("收到FIN的ACK");
-                    stopRetransmission();
+                    RetransmissionTask task = pendingPackets.remove(packet.getSeqNum());
+                    if (task != null) {
+                        task.cancel();
+                    }
                     state = State.FIN_WAIT2;
                 } else if (packet.getType() == Packet.TYPE_FIN) {
                     state = State.CLOSING;
-                    startRetransmission(new Packet(Packet.TYPE_ACK, packet.getSeqNum(), null, false), serverAddress, serverPort);
+                    Packet ackPacket = new Packet(Packet.TYPE_ACK, packet.getSeqNum(), null, false);
+                    sendWithRetransmission(ackPacket);
                 }
                 break;
 
             case FIN_WAIT2:
                 if (packet.getType() == Packet.TYPE_FIN) {
                     System.out.println("收到FIN，发送ACK");
-                    startRetransmission(new Packet(Packet.TYPE_ACK, packet.getSeqNum(), null, false), serverAddress, serverPort);
+                    Packet ackPacket = new Packet(Packet.TYPE_ACK, packet.getSeqNum(), null, false);
+                    sendWithRetransmission(ackPacket);
                     state = State.TIME_WAIT;
                     scheduleTimeWait();
                 }
@@ -182,7 +229,10 @@ public class ReliableUDPClient {
 
             case CLOSING:
                 if (packet.getType() == Packet.TYPE_ACK) {
-                    stopRetransmission();
+                    RetransmissionTask task = pendingPackets.remove(packet.getSeqNum());
+                    if (task != null) {
+                        task.cancel();
+                    }
                     state = State.TIME_WAIT;
                     scheduleTimeWait();
                 }
@@ -191,7 +241,10 @@ public class ReliableUDPClient {
             case LAST_ACK:
                 if (packet.getType() == Packet.TYPE_ACK) {
                     System.out.println("收到最后的ACK，关闭连接");
-                    stopRetransmission();
+                    RetransmissionTask task = pendingPackets.remove(packet.getSeqNum());
+                    if (task != null) {
+                        task.cancel();
+                    }
                     state = State.CLOSED;
                     cleanup();
                 }
@@ -200,9 +253,20 @@ public class ReliableUDPClient {
     }
 
     private void handleAck(Packet packet) {
-        stopRetransmission();
-        updateWindow(packet.getWindowSize());
-        System.out.println("收到ACK，序号: " + packet.getSeqNum() + "，窗口大小: " + packet.getWindowSize());
+        int ackNum = packet.getSeqNum();
+        
+        // 取消已确认包的重传
+        RetransmissionTask task = pendingPackets.remove(ackNum);
+        if (task != null) {
+            // 取消重传定时器
+            task.cancel();
+            
+            // 更新 RTT 估计值
+            updateRTT(ackNum, task.sendTime);
+            
+            System.out.println("收到ACK，序号: " + ackNum + "，当前 RTO: " + 
+                             calculateRTO() + "ms");
+        }
     }
 
     private void handleWindowUpdate(Packet packet) {
@@ -237,28 +301,64 @@ public class ReliableUDPClient {
         }
     }
 
+    /**
+     * 发送数据包并设置重传定时器
+     */
+    private void sendWithRetransmission(Packet packet) throws IOException {
+        // 发送数据包
+        sendPacket(packet, serverAddress, serverPort);
+        System.out.println("发送数据包，序号: " + packet.getSeqNum());
+
+        // 创建并保存重传任务
+        RetransmissionTask task = new RetransmissionTask(packet);
+        pendingPackets.put(packet.getSeqNum(), task);
+        task.scheduleRetransmission();
+    }
+
+    /**
+     * 更新 RTT 估计值（Karn/Partridge 算法）
+     */
+    private void updateRTT(int seqNum, long sendTime) {
+        RetransmissionTask task = pendingPackets.get(seqNum);
+        if (task != null && !task.isRetransmission) {
+            // 只对非重传包更新 RTT
+            long sampleRTT = System.currentTimeMillis() - sendTime;
+            
+            // 更新 SRTT: SRTT = (1-α)SRTT + α×SampleRTT
+            estimatedRTT = (1 - ALPHA) * estimatedRTT + ALPHA * sampleRTT;
+            
+            // 更新 RTTVAR: RTTVAR = (1-β)RTTVAR + β×|SampleRTT-SRTT|
+            devRTT = (1 - BETA) * devRTT + BETA * Math.abs(sampleRTT - estimatedRTT);
+            
+            System.out.println("更新 RTT - 样本: " + sampleRTT + "ms, SRTT: " + 
+                             String.format("%.2f", estimatedRTT) + "ms, RTTVAR: " + 
+                             String.format("%.2f", devRTT) + "ms");
+        }
+    }
+
+    /**
+     * 计算 RTO (Retransmission Timeout)
+     * RTO = SRTT + 4×RTTVAR
+     */
+    private long calculateRTO() {
+        return (long)(estimatedRTT + 4 * devRTT);
+    }
+
+    /**
+     * 发送数据
+     */
     public void send(String message) throws IOException, InterruptedException {
         if (state != State.ESTABLISHED) {
             throw new IOException("连接未建立");
         }
 
         byte[] data = message.getBytes();
-        waitForWindow();
-        synchronized (windowLock) {
-            if (receiverWindow > 0) {
-                receiverWindow--;
-                Packet packet = new Packet(Packet.TYPE_DATA, nextSeqNum++, data, true);
-                sendPacket(packet, serverAddress, serverPort);
-                System.out.println("发送数据包，序号: " + (nextSeqNum - 1) + "，剩余窗口: " + receiverWindow);
-            }
-        }
+        Packet packet = new Packet(Packet.TYPE_DATA, nextSeqNum++, data, true);
+        sendWithRetransmission(packet);
     }
 
     /**
-     * 模拟乱序发送数据包
-     * @param messages 要发送的消息列表
-     * @param delays 每个消息的延迟时间（毫秒）
-     * @throws IOException 如果发送失败
+     * 发送乱序数据
      */
     public void sendOutOfOrder(String[] messages, int[] delays) throws IOException, InterruptedException {
         if (messages.length != delays.length) {
@@ -274,18 +374,8 @@ public class ReliableUDPClient {
 
             futures.add(scheduler.schedule(() -> {
                 try {
-                    // 等待有可用窗口
-                    waitForWindow();
-                    
-                    // 发送数据包
-                    synchronized (windowLock) {
-                        if (receiverWindow > 0) {
-                            receiverWindow--;
-                            Packet packet = new Packet(Packet.TYPE_DATA, index, data, isLast);
-                            sendPacket(packet, serverAddress, serverPort);
-                            System.out.println("发送数据包，序号: " + index + "，剩余窗口: " + receiverWindow);
-                        }
-                    }
+                    Packet packet = new Packet(Packet.TYPE_DATA, index, data, isLast);
+                    sendWithRetransmission(packet);
                 } catch (Exception e) {
                     e.printStackTrace();
                 }
@@ -302,46 +392,12 @@ public class ReliableUDPClient {
         }
     }
 
-    private void startRetransmission(Packet packet, InetAddress address, int port) throws IOException {
-        stopRetransmission();
-        
-        RetransmissionTask task = new RetransmissionTask(packet, address, port);
-        currentRetransmissionTask = task;
-        
-        // 首次发送
-        sendPacket(packet, address, port);
-        
-        // 设置重传定时器
-        task.future = scheduler.scheduleWithFixedDelay(() -> {
-            try {
-                if (task.retries < MAX_RETRIES) {
-                    System.out.println("重传数据包，序号: " + packet.getSeqNum() + ", 重试次数: " + (task.retries + 1));
-                    sendPacket(packet, address, port);
-                    task.retries++;
-                    task.incrementTimeout();
-                } else {
-                    System.out.println("重传次数超过限制，关闭连接");
-                    stopRetransmission();
-                    cleanup();
-                }
-            } catch (IOException e) {
-                System.err.println("重传失败: " + e.getMessage());
-            }
-        }, task.currentTimeout, task.currentTimeout, TimeUnit.MILLISECONDS);
-    }
-
-    private void stopRetransmission() {
-        if (currentRetransmissionTask != null && currentRetransmissionTask.future != null) {
-            currentRetransmissionTask.future.cancel(false);
-            currentRetransmissionTask = null;
-        }
-    }
-
     public void disconnect() throws IOException {
         if (state == State.ESTABLISHED) {
             System.out.println("发送FIN包");
             state = State.FIN_WAIT1;
-            startRetransmission(new Packet(Packet.TYPE_FIN, 0, null, false), serverAddress, serverPort);
+            Packet packet = new Packet(Packet.TYPE_FIN, 0, null, false);
+            sendWithRetransmission(packet);
         }
     }
 
@@ -359,7 +415,10 @@ public class ReliableUDPClient {
 
     private void cleanup() {
         running = false;
-        stopRetransmission();
+        for (RetransmissionTask task : pendingPackets.values()) {
+            task.cancel();
+        }
+        pendingPackets.clear();
         if (timeWaitTimer != null) {
             timeWaitTimer.cancel(false);
         }
@@ -383,5 +442,15 @@ public class ReliableUDPClient {
 
     public State getState() {
         return state;
+    }
+
+    private volatile int receiverWindow = 16;  // 初始接收窗口大小
+    private final Object windowLock = new Object();
+    private volatile boolean windowUpdateReceived = false;
+
+    private void connectionLost() {
+        System.out.println("检测到连接丢失");
+        cleanup();
+        // 通知上层应用连接已断开
     }
 }

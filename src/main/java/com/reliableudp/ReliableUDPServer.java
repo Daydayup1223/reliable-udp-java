@@ -12,7 +12,7 @@ public class ReliableUDPServer {
     private static final int INIT_TIMEOUT = 1000; // Initial timeout 1 second
     private static final int MAX_TIMEOUT = 8000; // Maximum timeout 8 seconds
     private static final int MAX_RETRIES = 5;
-    private static final int RECEIVE_WINDOW_SIZE = 16; // 接收窗口大小
+    private static final int WINDOW_SIZE = 16; // 接收窗口大小
 
     private final int port;
     private DatagramSocket socket;
@@ -21,8 +21,10 @@ public class ReliableUDPServer {
     private final Map<String, CircularBuffer> receiveBuffers;  // 每个客户端的接收缓冲区
     private final ScheduledExecutorService scheduler;
 
-    public ReliableUDPServer(int port) {
+    public ReliableUDPServer(int port) throws SocketException {
         this.port = port;
+        this.socket = new DatagramSocket(port);
+        this.running = true;
         this.connectionStates = new ConcurrentHashMap<>();
         this.receiveBuffers = new ConcurrentHashMap<>();
         this.scheduler = Executors.newScheduledThreadPool(1);
@@ -85,7 +87,6 @@ public class ReliableUDPServer {
     }
 
     public void start() throws IOException {
-        socket = new DatagramSocket(port);
         socket.setSoTimeout(100); // 使用较短的超时以便及时处理所有类型的包
         running = true;
         System.out.println("服务器启动在端口: " + port);
@@ -133,8 +134,6 @@ public class ReliableUDPServer {
                     System.out.println("收到ACK，连接建立");
                     stopRetransmission(state);
                     state.state = State.ESTABLISHED;
-                    // 为新连接创建环形缓冲区
-                    receiveBuffers.put(clientId, new CircularBuffer(RECEIVE_WINDOW_SIZE));
                 }
                 break;
 
@@ -196,47 +195,36 @@ public class ReliableUDPServer {
         }
     }
 
+    private CircularBuffer getOrCreateBuffer(String clientId) {
+        return receiveBuffers.computeIfAbsent(clientId, k -> 
+            new CircularBuffer(WINDOW_SIZE, message -> {
+                System.out.println("处理来自 " + clientId + " 的消息: " + message);
+            })
+        );
+    }
+
     /**
      * 处理数据包
      */
     private void handleDataPacket(Packet packet, InetAddress clientAddress, int clientPort) throws IOException {
         String clientId = clientAddress.getHostAddress() + ":" + clientPort;
-        CircularBuffer buffer = receiveBuffers.get(clientId);
-        if (buffer == null) {
-            System.out.println("错误：未找到客户端的接收缓冲区");
-            return;
-        }
+        CircularBuffer buffer = getOrCreateBuffer(clientId);
 
         int seqNum = packet.getSeqNum();
         int result = buffer.put(seqNum, packet.getData());
         
         switch (result) {
             case 1: // 成功放入缓冲区
-                // 处理连续的数据包
-                buffer.processContiguous();
-                
                 // 发送ACK
-                sendAck(buffer.getNextSeq() - 1, buffer.getAvailableWindow(), clientAddress, clientPort);
-                
-                // 如果需要，发送窗口更新
-                if (buffer.needsWindowUpdate()) {
-                    System.out.println("发送窗口更新");
-                    sendAck(buffer.getNextSeq() - 1, buffer.getAvailableWindow(), clientAddress, clientPort);
-                }
-                
-                // 如果是最后一个包，打印完整消息
-                if (packet.isLast()) {
-                    String message = buffer.getAndClearMessage();
-                    System.out.println("收到完整消息: " + message);
-                }
+                sendAck(buffer.getNextSeq() - 1, buffer.getWindowSize(), clientAddress, clientPort);
                 break;
                 
-            case 0: // 重复的包，需要重发ACK
-                sendAck(buffer.getNextSeq() - 1, buffer.getAvailableWindow(), clientAddress, clientPort);
+            case 0: // 重复的包，重发ACK
+                sendAck(buffer.getNextSeq() - 1, buffer.getWindowSize(), clientAddress, clientPort);
                 break;
                 
-            case -1: // 窗口外的包，发送当前窗口大小
-                sendAck(buffer.getNextSeq() - 1, buffer.getAvailableWindow(), clientAddress, clientPort);
+            case -1: // 窗口外的包，丢弃并发送当前窗口位置
+                sendAck(buffer.getNextSeq() - 1, buffer.getWindowSize(), clientAddress, clientPort);
                 break;
         }
     }
@@ -302,8 +290,9 @@ public class ReliableUDPServer {
     }
 
     private void sendAck(int seqNum, int windowSize, InetAddress address, int port) throws IOException {
-        Packet packet = new Packet(Packet.TYPE_ACK, seqNum, null, false, windowSize);
-        sendPacket(packet, address, port);
+        Packet ackPacket = new Packet(Packet.TYPE_ACK, seqNum, null, false, windowSize);
+        sendPacket(ackPacket, address, port);
+        System.out.println("发送ACK，序号: " + seqNum + "，窗口大小: " + windowSize);
     }
 
     public void stop() {
