@@ -2,41 +2,37 @@ package com.reliableudp;
 
 import java.io.IOException;
 import java.net.*;
-import java.util.Arrays;
+import java.util.Random;
 import java.util.concurrent.*;
-import java.util.List;
-import java.util.ArrayList;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.HashMap;
+import java.util.Arrays;
 
 public class ReliableUDPClient {
-    private static final int BUFFER_SIZE = 1024;
-    private static final long MSL = 2000; // Maximum Segment Lifetime (2 seconds)
-    private static final int INIT_TIMEOUT = 1000; // Initial timeout 1 second
-    private static final int MAX_TIMEOUT = 8000; // Maximum timeout 8 seconds
-    private static final int MAX_RETRIES = 12;      // 最大重传次数
-    private static final int RETRANSMISSION_TIMEOUT = 1000; // 1秒超时
-
-    // RTT 相关常量
-    private static final int INITIAL_RTO = 1000;    // 初始 RTO 为 1秒
-    private static final int MIN_RTO = 200;         // 最小 RTO 为 200ms
-    private static final int MAX_RTO = 60000;       // 最大 RTO 为 60秒
-    private static final double ALPHA = 0.125;      // SRTT 更新权重
-    private static final double BETA = 0.25;        // RTTVAR 更新权重
-
-    private final String serverHost;
+    private final DatagramSocket socket;
+    private final InetAddress serverAddress;
     private final int serverPort;
-    private DatagramSocket socket;
-    private InetAddress serverAddress;
-    private State state;
     private final ScheduledExecutorService scheduler;
-    private RetransmissionTask currentRetransmissionTask;
-    private ScheduledFuture<?> timeWaitTimer;
     private volatile boolean running;
-    private final BlockingQueue<String> receivedMessages = new LinkedBlockingQueue<>();
+    private State state;
     private int nextSeqNum;
+    private int expectedSeqNum;
+    private static final int WINDOW_SIZE = 5;
+    private static final int INITIAL_TIMEOUT = 1000; // 初始RTO为1秒
+    private static final int MAX_RETRIES = 5;
+    private ScheduledFuture<?> timeWaitTimer;
+    private static final long MSL = 2000; // 2 seconds
+    private int localPort;
+    
+    // RTT和RTO相关的变量
+    private double estimatedRTT = 0;    // 预估的RTT
+    private double devRTT = 0;          // RTT偏差
+    private int RTO = INITIAL_TIMEOUT;   // 当前的超时时间
+    private static final double ALPHA = 0.125;  // RTT平滑因子
+    private static final double BETA = 0.25;    // 偏差平滑因子
+    private Map<Integer, Long> sendTimes;       // 记录发送时间
+    private Map<Integer, ScheduledFuture<?>> retransmissionTimers; // 重传定时器
 
-    // TCP-like connection states
     public enum State {
         CLOSED,
         SYN_SENT,
@@ -49,221 +45,179 @@ public class ReliableUDPClient {
         LAST_ACK
     }
 
-    private class RetransmissionTask {
-        private final Packet packet;
-        private volatile ScheduledFuture<?> future;
-        private volatile int retries;
-        private final long sendTime;
-        private volatile boolean isRetransmission;
-        private volatile boolean isCancelled;
+    public ReliableUDPClient(String serverHost, int serverPort) throws IOException {
+        this.socket = new DatagramSocket();
+        this.serverAddress = InetAddress.getByName(serverHost);
+        this.serverPort = serverPort;
+        this.scheduler = Executors.newScheduledThreadPool(1);
+        this.state = State.CLOSED;
+        this.localPort = socket.getLocalPort();
+        this.sendTimes = new HashMap<>();
+        this.retransmissionTimers = new HashMap<>();
+    }
 
-        public RetransmissionTask(Packet packet) {
-            this.packet = packet;
-            this.retries = 0;
-            this.sendTime = System.currentTimeMillis();
-            this.isRetransmission = false;
-            this.isCancelled = false;
-        }
-
-        public synchronized void cancel() {
-            if (!isCancelled) {
-                isCancelled = true;
-                if (future != null) {
-                    future.cancel(false);
-                }
-            }
-        }
-
-        public synchronized void scheduleRetransmission() {
-            if (isCancelled) {
-                return;
-            }
-
-            // 计算本次重传超时
-            long timeout = calculateRTO();
-            if (isRetransmission) {
-                // 使用二进制指数退避，但最多左移 5 位
-                timeout = Math.min(timeout * (1L << Math.min(retries, 5)), MAX_RTO);
+    // 更新RTT和RTO
+    private void updateRTT(int seqNum) {
+        Long sendTime = sendTimes.remove(seqNum);
+        if (sendTime != null) {
+            double sampleRTT = System.currentTimeMillis() - sendTime;
+            
+            if (estimatedRTT == 0) {
+                // 第一次测量
+                estimatedRTT = sampleRTT;
+                devRTT = sampleRTT / 2;
+            } else {
+                // 更新估计RTT和偏差
+                devRTT = (1 - BETA) * devRTT + BETA * Math.abs(sampleRTT - estimatedRTT);
+                estimatedRTT = (1 - ALPHA) * estimatedRTT + ALPHA * sampleRTT;
             }
             
-            // 确保在合理范围内
-            timeout = Math.max(timeout, MIN_RTO);
-            
-            final long finalTimeout = timeout;
-            //System.out.println(String.format("计划重传数据包，序号: %d，超时: %dms，重试次数: %d",
-            //    packet.getSeqNum(), finalTimeout, retries));
-            
-            future = scheduler.schedule(() -> {
-                synchronized (RetransmissionTask.this) {
-                    if (!isCancelled && retries < MAX_RETRIES) {
-                        try {
-                            retries++;
-                            isRetransmission = true;
-                            sendPacket(packet, serverAddress, serverPort);
-                            System.out.println(String.format("重传数据包，序号: %d，第 %d 次重试，下次超时: %dms", 
-                                packet.getSeqNum(), retries, finalTimeout * (1L << Math.min(retries, 5))));
-                            scheduleRetransmission();
-                        } catch (IOException e) {
-                            e.printStackTrace();
-                        }
-                    } else if (!isCancelled) {
-                        System.out.println("数据包重传次数超过限制，序号: " + packet.getSeqNum());
-                        connectionLost();
-                    }
-                }
-            }, timeout, TimeUnit.MILLISECONDS);
-        }
-
-        public boolean isRetransmission() {
-            return isRetransmission;
-        }
-
-        public long getSendTime() {
-            return sendTime;
+            // 计算新的RTO (至少100ms)
+            RTO = (int) Math.max(100, estimatedRTT + 4 * devRTT);
+            System.out.println("Updated RTT: estimated=" + estimatedRTT + "ms, deviation=" + devRTT + "ms, RTO=" + RTO + "ms");
         }
     }
 
-    // RTT 估计值
-    private double estimatedRTT = INITIAL_RTO;  // SRTT (Smoothed RTT)
-    private double devRTT = INITIAL_RTO / 2.0;  // RTTVAR (RTT Variation)
-    private final Map<Integer, RetransmissionTask> pendingPackets = new ConcurrentHashMap<>();
+    // 发送数据包并设置重传定时器
+    private void sendWithRTO(Packet packet) throws IOException {
+        int seqNum = packet.getSeqNum();
+        sendTimes.put(seqNum, System.currentTimeMillis());
+        
+        // 取消已有的重传定时器（如果存在）
+        cancelRetransmissionTimer(seqNum);
 
-    public ReliableUDPClient(String serverHost, int serverPort) throws UnknownHostException {
-        this.serverHost = serverHost;
-        this.serverPort = serverPort;
-        this.serverAddress = InetAddress.getByName(serverHost);
-        this.state = State.CLOSED;
-        this.scheduler = Executors.newScheduledThreadPool(1);
-        this.nextSeqNum = 0;
+        // 发送数据包
+        send(packet);
+
+        // 设置新的重传定时器
+        ScheduledFuture<?> timer = scheduler.schedule(() -> {
+            try {
+                // 只有在还没收到ACK时才重传
+                if (sendTimes.containsKey(seqNum)) {
+                    System.out.println("Packet timeout, retransmitting seq=" + seqNum);
+                    // 超时重传，使用指数退避
+                    RTO *= 2; // 指数退避
+                    sendWithRTO(packet);
+                }
+            } catch (IOException e) {
+                System.err.println("重传错误: " + e.getMessage());
+                e.printStackTrace();
+            }
+        }, RTO, TimeUnit.MILLISECONDS);
+        
+        retransmissionTimers.put(seqNum, timer);
+    }
+
+    // 取消重传定时器
+    private void cancelRetransmissionTimer(int seqNum) {
+        ScheduledFuture<?> timer = retransmissionTimers.remove(seqNum);
+        if (timer != null) {
+            timer.cancel(false);
+        }
+        // 同时清除发送时间记录
+        sendTimes.remove(seqNum);
     }
 
     public void connect() throws IOException {
         if (state != State.CLOSED) {
-            throw new IOException("已经连接或正在连接");
+            throw new IllegalStateException("Client must be in CLOSED state to connect");
         }
 
-        // 初始化连接
-        socket = new DatagramSocket();
-        socket.setSoTimeout(100);  // 设置超时以便及时处理所有类型的包
-        running = true;
+        // 生成初始序列号
+        Random random = new Random();
+        nextSeqNum = random.nextInt(10000);
+
+        // 发送 SYN
+        Packet synPacket = Packet.createSYN(
+            socket.getLocalPort(),
+            serverPort,
+            nextSeqNum,
+            WINDOW_SIZE
+        );
+        sendWithRTO(synPacket);
         state = State.SYN_SENT;
 
-        // 启动接收线程
-        startReceiveThread();
-
-        // 发送SYN包
-        System.out.println("发送SYN包");
-        Packet packet = new Packet(Packet.TYPE_SYN, 0, null, false);
-        sendWithRetransmission(packet);
-
         // 等待连接建立
-        try {
-            long startTime = System.currentTimeMillis();
-            while (state != State.ESTABLISHED && System.currentTimeMillis() - startTime < 5000) {
-                Thread.sleep(100);
-                if (!running) {
-                    throw new IOException("连接失败");
-                }
-            }
-            if (state != State.ESTABLISHED) {
-                cleanup();
-                throw new IOException("连接超时");
-            }
-            System.out.println("连接已建立");
-        } catch (InterruptedException e) {
-            cleanup();
-            Thread.currentThread().interrupt();
-            throw new IOException("连接被中断");
-        }
+        waitForConnection();
     }
 
-    private void startReceiveThread() {
-        new Thread(this::receiveLoop).start();
-    }
-
-    private void receiveLoop() {
-        while (running) {
+    private void waitForConnection() throws IOException {
+        while (state != State.ESTABLISHED && state != State.CLOSED) {
             try {
-                byte[] receiveData = new byte[BUFFER_SIZE];
+                byte[] receiveData = new byte[1024];
                 DatagramPacket receivePacket = new DatagramPacket(receiveData, receiveData.length);
+                socket.setSoTimeout(INITIAL_TIMEOUT);
                 socket.receive(receivePacket);
 
-                Packet packet = Packet.fromBytes(Arrays.copyOf(receivePacket.getData(), receivePacket.getLength()));
-                handlePacket(packet);
-
-            } catch (SocketTimeoutException e) {
-                continue;
-            } catch (IOException e) {
-                if (running) {
-                    System.err.println("接收数据时发生错误: " + e.getMessage());
+                // 只使用实际接收到的数据
+                byte[] actualData = Arrays.copyOf(receivePacket.getData(), receivePacket.getLength());
+                Packet packet = Packet.fromBytes(actualData);
+                if (packet != null) {
+                    handlePacket(packet);
                 }
+            } catch (SocketTimeoutException e) {
+                // 超时继续等待
             }
         }
     }
 
     private void handlePacket(Packet packet) throws IOException {
+        // 处理确认
+        if (packet.getFlags() == Packet.FLAG_ACK) {
+            int ackNum = packet.getAckNum();
+            // 更新RTT
+            Long sendTime = sendTimes.get(ackNum);
+            if (sendTime != null) {
+                updateRTT(ackNum);
+                // 立即取消重传定时器
+                cancelRetransmissionTimer(ackNum);
+                System.out.println("收到ACK " + ackNum + "，取消重传定时器");
+            }
+        }
+
         switch (state) {
             case SYN_SENT:
                 if (packet.getType() == Packet.TYPE_SYN_ACK) {
-                    System.out.println("收到SYN-ACK，发送ACK");
-                    Packet ackPacket = new Packet(Packet.TYPE_ACK, 0, null, false);
-                    sendWithRetransmission(ackPacket);
-                    state = State.ESTABLISHED;
-                    System.out.println("连接已建立");
+                    handleConnectionResponse(packet);
                 }
                 break;
 
             case ESTABLISHED:
-                if (packet.getType() == Packet.TYPE_ACK) {
-                    handleAck(packet);
-                } else if (packet.getType() == Packet.TYPE_WINDOW_UPDATE) {
-                    handleWindowUpdate(packet);
+                if (packet.getType() == Packet.TYPE_FIN) {
+                    // 收到FIN，进入CLOSE_WAIT状态
+                    state = State.CLOSE_WAIT;
+                    sendACK(packet);
+                } else if (packet.getType() == Packet.TYPE_DATA && packet.getFlags() == Packet.FLAG_ACK) {
+                    // 处理数据确认
+                    updateRTT(packet.getAckNum());
                 }
                 break;
 
             case FIN_WAIT1:
                 if (packet.getType() == Packet.TYPE_ACK) {
-                    System.out.println("收到FIN的ACK");
-                    RetransmissionTask task = pendingPackets.remove(packet.getSeqNum());
-                    if (task != null) {
-                        task.cancel();
-                    }
                     state = State.FIN_WAIT2;
                 } else if (packet.getType() == Packet.TYPE_FIN) {
+                    // 同时关闭的情况
                     state = State.CLOSING;
-                    Packet ackPacket = new Packet(Packet.TYPE_ACK, packet.getSeqNum(), null, false);
-                    sendWithRetransmission(ackPacket);
+                    sendACK(packet);
                 }
                 break;
 
             case FIN_WAIT2:
                 if (packet.getType() == Packet.TYPE_FIN) {
-                    System.out.println("收到FIN，发送ACK");
-                    Packet ackPacket = new Packet(Packet.TYPE_ACK, packet.getSeqNum(), null, false);
-                    sendWithRetransmission(ackPacket);
-                    state = State.TIME_WAIT;
-                    scheduleTimeWait();
+                    sendACK(packet);
+                    startTimeWaitTimer();
                 }
                 break;
 
             case CLOSING:
                 if (packet.getType() == Packet.TYPE_ACK) {
-                    RetransmissionTask task = pendingPackets.remove(packet.getSeqNum());
-                    if (task != null) {
-                        task.cancel();
-                    }
-                    state = State.TIME_WAIT;
-                    scheduleTimeWait();
+                    startTimeWaitTimer();
                 }
                 break;
 
             case LAST_ACK:
                 if (packet.getType() == Packet.TYPE_ACK) {
-                    System.out.println("收到最后的ACK，关闭连接");
-                    RetransmissionTask task = pendingPackets.remove(packet.getSeqNum());
-                    if (task != null) {
-                        task.cancel();
-                    }
                     state = State.CLOSED;
                     cleanup();
                 }
@@ -271,236 +225,133 @@ public class ReliableUDPClient {
         }
     }
 
-    /**
-     * 处理 ACK 包，使用累积确认
-     */
-    private void handleAck(Packet packet) {
-        int ackNum = packet.getSeqNum();
-        
-        // 找出所有需要取消的重传任务
-        List<Integer> toRemove = new ArrayList<>();
-        for (Map.Entry<Integer, RetransmissionTask> entry : pendingPackets.entrySet()) {
-            if (entry.getKey() <= ackNum) {
-                toRemove.add(entry.getKey());
-            }
+    private void handleConnectionResponse(Packet packet) throws IOException {
+        if (packet.getType() == Packet.TYPE_SYN_ACK) {
+            expectedSeqNum = packet.getNextSeqNum();
+            nextSeqNum++;
+
+            // 发送 ACK
+            Packet ackPacket = Packet.createData(
+                socket.getLocalPort(),
+                serverPort,
+                nextSeqNum,
+                expectedSeqNum,
+                null,
+                WINDOW_SIZE
+            );
+            sendWithRTO(ackPacket);
+            state = State.ESTABLISHED;
         }
-        
-        // 批量处理确认
-        if (!toRemove.isEmpty()) {
-            int maxAcked = -1;
-            for (Integer seqNum : toRemove) {
-                RetransmissionTask task = pendingPackets.remove(seqNum);
-                if (task != null) {
-                    task.cancel();
-                    maxAcked = Math.max(maxAcked, seqNum);
-                    
-                    // 只对最大的非重传包更新 RTT
-                    if (!task.isRetransmission() && seqNum == maxAcked) {
-                        updateRTT(seqNum, task.getSendTime());
-                    }
-                }
-            }
+    }
+
+    private void handleData(Packet packet) throws IOException {
+        if (packet.getSeqNum() == expectedSeqNum) {
+            expectedSeqNum++;
+            sendACK(packet);
             
-            if (maxAcked >= 0) {
-                System.out.println(String.format("批量确认到序号: %d，当前 RTO: %dms", 
-                    maxAcked, calculateRTO()));
+            if (packet.getData() != null) {
+                String message = new String(packet.getData());
+                System.out.println("Received: " + message);
             }
-        }
-        
-        // 更新接收窗口大小
-        updateReceiverWindow(packet.getWindowSize());
-    }
-
-    private void handleWindowUpdate(Packet packet) {
-        updateWindow(packet.getWindowSize());
-        synchronized (windowLock) {
-            windowUpdateReceived = true;
-            windowLock.notifyAll();
-        }
-        System.out.println("收到窗口更新，新窗口大小: " + packet.getWindowSize());
-    }
-
-    private void updateWindow(int newWindow) {
-        if (newWindow >= 0) {
-            synchronized (windowLock) {
-                receiverWindow = newWindow;
-                if (receiverWindow > 0) {
-                    windowLock.notifyAll();
-                }
-            }
+        } else {
+            sendACK(packet);
         }
     }
 
-    private void waitForWindow() throws InterruptedException {
-        synchronized (windowLock) {
-            while (receiverWindow <= 0 && !windowUpdateReceived) {
-                System.out.println("等待接收窗口...");
-                windowLock.wait(calculateRTO());
-            }
-            windowUpdateReceived = false;
-        }
-    }
-
-    /**
-     * 发送数据包并设置重传定时器
-     */
-    private void sendWithRetransmission(Packet packet) throws IOException {
-        // 发送数据包
-        sendPacket(packet, serverAddress, serverPort);
-        System.out.println("发送数据包，序号: " + packet.getSeqNum());
-
-        // 创建并保存重传任务
-        RetransmissionTask task = new RetransmissionTask(packet);
-        pendingPackets.put(packet.getSeqNum(), task);
-        task.scheduleRetransmission();
-    }
-
-    /**
-     * 更新 RTT 估计值（Karn/Partridge 算法）
-     */
-    private void updateRTT(int seqNum, long sendTime) {
-        // 计算样本 RTT
-        long sampleRTT = System.currentTimeMillis() - sendTime;
-        
-        // 更新 SRTT: SRTT = (1-α)SRTT + α×SampleRTT
-        estimatedRTT = (1 - ALPHA) * estimatedRTT + ALPHA * sampleRTT;
-        
-        // 更新 RTTVAR: RTTVAR = (1-β)RTTVAR + β×|SampleRTT-SRTT|
-        devRTT = (1 - BETA) * devRTT + BETA * Math.abs(sampleRTT - estimatedRTT);
-        
-        System.out.println(String.format("更新 RTT - 样本: %dms, SRTT: %.2fms, RTTVAR: %.2fms, 序号: %d", 
-            sampleRTT, estimatedRTT, devRTT, seqNum));
-    }
-
-    /**
-     * 计算 RTO (Retransmission Timeout)
-     * RTO = SRTT + 4×RTTVAR
-     */
-    private long calculateRTO() {
-        return Math.min(Math.max((long)(estimatedRTT + 4 * devRTT), MIN_RTO), MAX_RTO);
-    }
-
-    /**
-     * 发送数据
-     */
-    public void send(String message) throws IOException, InterruptedException {
+    public void send(byte[] data) throws IOException {
         if (state != State.ESTABLISHED) {
-            throw new IOException("连接未建立");
+            throw new IllegalStateException("Connection not established");
         }
 
-        byte[] data = message.getBytes();
-        Packet packet = new Packet(Packet.TYPE_DATA, nextSeqNum++, data, true);
-        sendWithRetransmission(packet);
-    }
-
-    /**
-     * 发送乱序数据
-     */
-    public void sendOutOfOrder(String[] messages, int[] delays) throws IOException, InterruptedException {
-        if (messages.length != delays.length) {
-            throw new IllegalArgumentException("消息数量必须等于延迟数量");
-        }
-
-        // 创建发送任务
-        List<ScheduledFuture<?>> futures = new ArrayList<>();
-        for (int i = 0; i < messages.length; i++) {
-            final int index = i;
-            final byte[] data = messages[i].getBytes();
-            boolean isLast = (i == messages.length - 1);
-
-            futures.add(scheduler.schedule(() -> {
-                try {
-                    Packet packet = new Packet(Packet.TYPE_DATA, index, data, isLast);
-                    sendWithRetransmission(packet);
-                } catch (Exception e) {
-                    e.printStackTrace();
-                }
-            }, delays[i], TimeUnit.MILLISECONDS));
-        }
-
-        // 等待所有任务完成
-        for (ScheduledFuture<?> future : futures) {
-            try {
-                future.get();
-            } catch (ExecutionException e) {
-                e.printStackTrace();
-            }
-        }
+        Packet packet = Packet.createData(
+            socket.getLocalPort(),
+            serverPort,
+            nextSeqNum,
+            expectedSeqNum,
+            data,
+            WINDOW_SIZE
+        );
+        sendWithRTO(packet);
+        nextSeqNum++;
     }
 
     public void disconnect() throws IOException {
         if (state == State.ESTABLISHED) {
-            System.out.println("发送FIN包");
-            state = State.FIN_WAIT1;
-            Packet packet = new Packet(Packet.TYPE_FIN, 0, null, false);
-            sendWithRetransmission(packet);
+            sendFIN();
+            waitForDisconnection();
         }
     }
 
-    private void scheduleTimeWait() {
-        if (timeWaitTimer != null) {
-            timeWaitTimer.cancel(false);
-        }
-        
-        timeWaitTimer = scheduler.schedule(() -> {
-            System.out.println("TIME_WAIT超时，关闭连接");
-            cleanup();
-            return null;
-        }, 2 * MSL, TimeUnit.MILLISECONDS);
+    private void sendFIN() throws IOException {
+        Packet finPacket = Packet.createFIN(
+            localPort,
+            serverPort,
+            nextSeqNum,
+            expectedSeqNum,
+            WINDOW_SIZE
+        );
+        sendWithRTO(finPacket);
+        state = State.FIN_WAIT1;
     }
 
-    private void cleanup() {
-        running = false;
-        for (RetransmissionTask task : pendingPackets.values()) {
-            task.cancel();
-        }
-        pendingPackets.clear();
-        if (timeWaitTimer != null) {
-            timeWaitTimer.cancel(false);
-        }
-        if (socket != null && !socket.isClosed()) {
-            socket.close();
-        }
-        state = State.CLOSED;
-    }
+    private void waitForDisconnection() throws IOException {
+        while (state != State.CLOSED) {
+            try {
+                byte[] receiveData = new byte[1024];
+                DatagramPacket receivePacket = new DatagramPacket(receiveData, receiveData.length);
+                socket.setSoTimeout(INITIAL_TIMEOUT);
+                socket.receive(receivePacket);
 
-    private void sendPacket(Packet packet, InetAddress address, int port) throws IOException {
-        byte[] data = packet.toBytes();
-        DatagramPacket datagramPacket = new DatagramPacket(data, data.length, address, port);
-        socket.send(datagramPacket);
-    }
-
-    public void close() {
-        running = false;
-        scheduler.shutdown();
-        cleanup();
-    }
-
-    public State getState() {
-        return state;
-    }
-
-    private volatile int receiverWindow = 16;  // 初始接收窗口大小
-    private final Object windowLock = new Object();
-    private volatile boolean windowUpdateReceived = false;
-
-    /**
-     * 更新接收窗口大小
-     */
-    private synchronized void updateReceiverWindow(int newSize) {
-        synchronized (windowLock) {
-            if (newSize != receiverWindow) {
-                System.out.println("更新接收窗口大小: " + newSize);
-                receiverWindow = newSize;
-                windowUpdateReceived = true;
-                windowLock.notifyAll();
+                // 只使用实际接收到的数据
+                byte[] actualData = Arrays.copyOf(receivePacket.getData(), receivePacket.getLength());
+                Packet packet = Packet.fromBytes(actualData);
+                if (packet != null) {
+                    handlePacket(packet);
+                }
+            } catch (SocketTimeoutException e) {
+                // 超时继续等待
             }
         }
     }
 
-    private void connectionLost() {
-        System.out.println("检测到连接丢失");
-        cleanup();
-        // 通知上层应用连接已断开
+    private void sendACK(Packet receivedPacket) throws IOException {
+        Packet ackPacket = Packet.createData(
+            socket.getLocalPort(),
+            serverPort,
+            nextSeqNum,
+            receivedPacket.getSeqNum() + 1,
+            null,
+            WINDOW_SIZE
+        );
+        sendWithRTO(ackPacket);
+    }
+
+    private void startTimeWaitTimer() {
+        if (timeWaitTimer != null) {
+            timeWaitTimer.cancel(false);
+        }
+        timeWaitTimer = scheduler.schedule(() -> {
+            state = State.CLOSED;
+            cleanup();
+        }, 2 * MSL, TimeUnit.MILLISECONDS);
+    }
+
+    private void send(Packet packet) throws IOException {
+        byte[] sendData = packet.toBytes();
+        DatagramPacket datagramPacket = new DatagramPacket(
+            sendData,
+            sendData.length,
+            serverAddress,
+            serverPort
+        );
+        socket.send(datagramPacket);
+    }
+
+    private void cleanup() {
+        if (timeWaitTimer != null) {
+            timeWaitTimer.cancel(false);
+        }
+        scheduler.shutdown();
+        socket.close();
     }
 }

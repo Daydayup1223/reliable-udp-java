@@ -8,23 +8,23 @@ import java.util.concurrent.*;
 
 public class ReliableUDPServer {
     private static final int BUFFER_SIZE = 1024;
+    private static final int WINDOW_SIZE = 1024;
     private static final long MSL = 2000; // Maximum Segment Lifetime (2 seconds)
     private static final int INIT_TIMEOUT = 1000; // Initial timeout 1 second
     private static final int MAX_TIMEOUT = 8000; // Maximum timeout 8 seconds
     private static final int MAX_RETRIES = 5;
-    private static final int WINDOW_SIZE = 16; // 接收窗口大小
 
     private final int port;
-    private DatagramSocket socket;
+    private final DatagramSocket socket;
     private volatile boolean running;
     private final Map<String, ConnectionState> connectionStates;
-    private final Map<String, CircularBuffer> receiveBuffers;  // 每个客户端的接收缓冲区
+    private final Map<String, CircularBuffer> receiveBuffers;
     private final ScheduledExecutorService scheduler;
 
     public ReliableUDPServer(int port) throws SocketException {
         this.port = port;
         this.socket = new DatagramSocket(port);
-        this.running = true;
+        this.running = false;
         this.connectionStates = new ConcurrentHashMap<>();
         this.receiveBuffers = new ConcurrentHashMap<>();
         this.scheduler = Executors.newScheduledThreadPool(1);
@@ -32,16 +32,80 @@ public class ReliableUDPServer {
 
     // TCP-like connection states
     public enum State {
-        CLOSED,
-        LISTEN,
-        SYN_RCVD,
-        ESTABLISHED,
-        CLOSE_WAIT,
-        LAST_ACK,
-        FIN_WAIT1,
-        FIN_WAIT2,
-        CLOSING,
-        TIME_WAIT
+        CLOSED,         // 初始状态
+        LISTEN,         // 服务器监听状态
+        SYN_RCVD,      // 服务器收到SYN后的状态
+        SYN_SENT,      // 客户端发送SYN后的状态
+        ESTABLISHED,    // 连接建立状态
+        FIN_WAIT1,     // 主动关闭方发送FIN后的状态
+        FIN_WAIT2,     // 主动关闭方收到ACK后的状态
+        CLOSING,       // 双方同时关闭时的状态
+        TIME_WAIT,     // 等待2MSL的状态
+        CLOSE_WAIT,    // 被动关闭方收到FIN后的状态
+        LAST_ACK       // 被动关闭方发送FIN后的状态
+    }
+
+    private class ConnectionState {
+        State state;
+        ScheduledFuture<?> timeWaitTimer;
+        RetransmissionTask currentRetransmissionTask;
+        long lastActivityTime;
+        int nextSeqNum;
+        int expectedSeqNum;
+        private static final long MSL = 2000; // 2 seconds
+
+        ConnectionState() {
+            this.state = State.LISTEN;  // 服务器端初始状态为LISTEN
+            this.lastActivityTime = System.currentTimeMillis();
+        }
+
+        public synchronized State getState() {
+            return state;
+        }
+
+        public synchronized void setState(State state) {
+            this.state = state;
+            this.lastActivityTime = System.currentTimeMillis();
+            
+            // 如果进入TIME_WAIT状态，启动2MSL定时器
+            if (state == State.TIME_WAIT) {
+                if (timeWaitTimer != null) {
+                    timeWaitTimer.cancel(false);
+                }
+                timeWaitTimer = scheduler.schedule(() -> {
+                    synchronized (ConnectionState.this) {
+                        if (getState() == State.TIME_WAIT) {
+                            setState(State.CLOSED);
+                        }
+                    }
+                }, 2 * MSL, TimeUnit.MILLISECONDS);
+            }
+        }
+
+        public void cancelTimers() {
+            if (timeWaitTimer != null) {
+                timeWaitTimer.cancel(false);
+            }
+            if (currentRetransmissionTask != null && currentRetransmissionTask.future != null) {
+                currentRetransmissionTask.future.cancel(false);
+            }
+        }
+
+        public int getNextSeqNum() {
+            return nextSeqNum;
+        }
+
+        public void setNextSeqNum(int nextSeqNum) {
+            this.nextSeqNum = nextSeqNum;
+        }
+
+        public int getExpectedSeqNum() {
+            return expectedSeqNum;
+        }
+
+        public void setExpectedSeqNum(int expectedSeqNum) {
+            this.expectedSeqNum = expectedSeqNum;
+        }
     }
 
     private static class RetransmissionTask {
@@ -65,88 +129,82 @@ public class ReliableUDPServer {
         }
     }
 
-    private static class ConnectionState {
-        State state;
-        ScheduledFuture<?> timeWaitTimer;
-        RetransmissionTask currentRetransmissionTask;
-        long lastActivityTime;
-
-        ConnectionState() {
-            this.state = State.CLOSED;
-            this.lastActivityTime = System.currentTimeMillis();
-        }
-
-        void cancelTimers() {
-            if (timeWaitTimer != null) {
-                timeWaitTimer.cancel(false);
-            }
-            if (currentRetransmissionTask != null && currentRetransmissionTask.future != null) {
-                currentRetransmissionTask.future.cancel(false);
-            }
-        }
-    }
-
     public void start() throws IOException {
-        socket.setSoTimeout(100); // 使用较短的超时以便及时处理所有类型的包
-        running = true;
-        System.out.println("服务器启动在端口: " + port);
+        try {
+            socket.setSoTimeout(100); // 使用较短的超时以便及时处理所有类型的包
+            running = true;
+            System.out.println("Server started on port " + port);
 
-        while (running) {
-            try {
-                byte[] receiveData = new byte[BUFFER_SIZE];
-                DatagramPacket receivePacket = new DatagramPacket(receiveData, receiveData.length);
-                socket.receive(receivePacket);
+            while (running) {
+                try {
+                    // 接收数据包
+                    byte[] buffer = new byte[BUFFER_SIZE];
+                    DatagramPacket datagramPacket = new DatagramPacket(buffer, buffer.length);
+                    socket.receive(datagramPacket);
 
-                Packet packet = Packet.fromBytes(Arrays.copyOf(receivePacket.getData(), receivePacket.getLength()));
-                InetAddress clientAddress = receivePacket.getAddress();
-                int clientPort = receivePacket.getPort();
-                String clientId = clientAddress.getHostAddress() + ":" + clientPort;
+                    // 解析数据包
+                    Packet packet = Packet.fromBytes(Arrays.copyOf(buffer, datagramPacket.getLength()));
+                    if (packet == null) {
+                        System.err.println("Failed to parse packet, length=" + datagramPacket.getLength());
+                        continue;
+                    }
 
-                ConnectionState state = connectionStates.computeIfAbsent(clientId, k -> {
-                    ConnectionState newState = new ConnectionState();
-                    newState.state = State.LISTEN;
-                    return newState;
-                });
-                state.lastActivityTime = System.currentTimeMillis();
+                    System.out.println("收到数据包：type=" + packet.getType() + ", from=" + 
+                                     datagramPacket.getAddress() + ":" + datagramPacket.getPort());
 
-                handlePacket(packet, state, clientAddress, clientPort, clientId);
+                    handlePacket(packet, datagramPacket.getAddress(), datagramPacket.getPort());
 
-            } catch (SocketTimeoutException e) {
-                continue;
-            } catch (IOException e) {
-                System.err.println("处理数据包时发生错误: " + e.getMessage());
+                } catch (SocketTimeoutException e) {
+                    // 正常超时，继续循环
+                    continue;
+                } catch (IOException e) {
+                    if (running) {
+                        System.err.println("接收数据包时发生错误: " + e.getMessage());
+                        e.printStackTrace();
+                    }
+                } catch (Exception e) {
+                    if (running) {
+                        System.err.println("处理数据包时发生错误: " + e.getMessage());
+                        e.printStackTrace();
+                    }
+                }
             }
+        } catch (Exception e) {
+            System.err.println("服务器启动失败: " + e.getMessage());
+            e.printStackTrace();
+            throw e;
         }
     }
 
-    private void handlePacket(Packet packet, ConnectionState state, InetAddress clientAddress, int clientPort, String clientId) throws IOException {
-        switch (state.state) {
+    private void handlePacket(Packet packet, InetAddress clientAddress, int clientPort) throws IOException {
+        String clientKey = clientAddress.getHostAddress() + ":" + clientPort;
+        ConnectionState state = connectionStates.computeIfAbsent(clientKey, k -> new ConnectionState());
+
+        switch (state.getState()) {
             case LISTEN:
                 if (packet.getType() == Packet.TYPE_SYN) {
-                    System.out.println("收到SYN包，发送SYN-ACK");
-                    state.state = State.SYN_RCVD;
-                    startRetransmission(new Packet(Packet.TYPE_SYN_ACK, 0, null, false), clientAddress, clientPort, state);
+                    handleSYN(packet, state, clientAddress, clientPort);
                 }
                 break;
 
             case SYN_RCVD:
-                if (packet.getType() == Packet.TYPE_ACK) {
-                    System.out.println("收到ACK，连接建立");
-                    stopRetransmission(state);
-                    state.state = State.ESTABLISHED;
+                if (packet.isACK() && !packet.isSYN() && packet.getAckNum() == state.getNextSeqNum()) {
+                    state.setState(State.ESTABLISHED);
+                    System.out.println("Connection established with " + clientKey);
                 }
                 break;
 
             case ESTABLISHED:
-                if (packet.getType() == Packet.TYPE_DATA) {
-                    handleDataPacket(packet, clientAddress, clientPort);
-                } else if (packet.getType() == Packet.TYPE_FIN) {
-                    System.out.println("收到FIN包，发送ACK");
-                    state.state = State.CLOSE_WAIT;
-                    sendPacket(new Packet(Packet.TYPE_ACK, packet.getSeqNum(), null, false), clientAddress, clientPort);
-                    System.out.println("发送FIN包");
-                    state.state = State.LAST_ACK;
-                    startRetransmission(new Packet(Packet.TYPE_FIN, 0, null, false), clientAddress, clientPort, state);
+                if (packet.getType() == Packet.TYPE_FIN) {
+                    // 收到FIN，进入CLOSE_WAIT状态
+                    state.setState(State.CLOSE_WAIT);
+                    // 发送ACK
+                    sendACK(packet, clientAddress, clientPort);
+                    // 发送FIN
+                    sendFIN(clientAddress, clientPort);
+                    state.setState(State.LAST_ACK);
+                } else if (packet.getType() == Packet.TYPE_DATA) {
+                    handleData(packet, state, clientAddress, clientPort);
                 }
                 break;
 
@@ -155,144 +213,111 @@ public class ReliableUDPServer {
                 break;
 
             case LAST_ACK:
-                if (packet.getType() == Packet.TYPE_ACK) {
-                    System.out.println("收到最后的ACK，关闭连接");
-                    stopRetransmission(state);
-                    state.state = State.CLOSED;
-                    cleanup(clientId);
+                if (packet.isACK()) {
+                    state.setState(State.CLOSED);
+                    cleanup(clientKey);
                 }
                 break;
 
             case FIN_WAIT1:
-                if (packet.getType() == Packet.TYPE_ACK) {
-                    stopRetransmission(state);
-                    state.state = State.FIN_WAIT2;
+                if (packet.isACK()) {
+                    state.setState(State.FIN_WAIT2);
                 } else if (packet.getType() == Packet.TYPE_FIN) {
-                    state.state = State.CLOSING;
-                    startRetransmission(new Packet(Packet.TYPE_ACK, packet.getSeqNum(), null, false), clientAddress, clientPort, state);
+                    state.setState(State.CLOSING);
+                    sendACK(packet, clientAddress, clientPort);
                 }
                 break;
 
             case FIN_WAIT2:
                 if (packet.getType() == Packet.TYPE_FIN) {
-                    startRetransmission(new Packet(Packet.TYPE_ACK, packet.getSeqNum(), null, false), clientAddress, clientPort, state);
-                    state.state = State.TIME_WAIT;
-                    scheduleTimeWait(clientId);
+                    sendACK(packet, clientAddress, clientPort);
+                    state.setState(State.TIME_WAIT);
                 }
                 break;
 
             case CLOSING:
-                if (packet.getType() == Packet.TYPE_ACK) {
-                    stopRetransmission(state);
-                    state.state = State.TIME_WAIT;
-                    scheduleTimeWait(clientId);
+                if (packet.isACK()) {
+                    state.setState(State.TIME_WAIT);
                 }
                 break;
 
             case TIME_WAIT:
-                // 等待2MSL后关闭
+                // 在ConnectionState中已经处理了2MSL定时器
                 break;
         }
     }
 
-    private CircularBuffer getOrCreateBuffer(String clientId) {
-        return receiveBuffers.computeIfAbsent(clientId, k -> 
-            new CircularBuffer(WINDOW_SIZE, message -> {
-                System.out.println("处理来自 " + clientId + " 的消息: " + message);
-            })
+    private void handleSYN(Packet packet, ConnectionState state, InetAddress clientAddress, int clientPort) throws IOException {
+        int clientSeqNum = packet.getSeqNum();
+        int serverInitSeqNum = (int) (Math.random() * Integer.MAX_VALUE);
+        
+        state.setNextSeqNum(serverInitSeqNum + 1);
+        state.setExpectedSeqNum(clientSeqNum + 1);
+        state.setState(State.SYN_RCVD);
+
+        // 发送 SYN-ACK
+        Packet synAckPacket = Packet.createSYNACK(
+            port,
+            clientPort,
+            serverInitSeqNum,
+            clientSeqNum + 1,
+            WINDOW_SIZE
         );
+        sendPacket(synAckPacket, clientAddress, clientPort);
     }
 
-    /**
-     * 处理数据包
-     */
-    private void handleDataPacket(Packet packet, InetAddress clientAddress, int clientPort) throws IOException {
-        String clientId = clientAddress.getHostAddress() + ":" + clientPort;
-        CircularBuffer buffer = getOrCreateBuffer(clientId);
-
-        int seqNum = packet.getSeqNum();
-        int result = buffer.put(seqNum, packet.getData());
-        
-        switch (result) {
-            case 1: // 成功放入缓冲区
-                // 发送ACK
-                sendAck(buffer.getNextSeq() - 1, buffer.getWindowSize(), clientAddress, clientPort);
-                break;
-                
-            case 0: // 重复的包，重发ACK
-                sendAck(buffer.getNextSeq() - 1, buffer.getWindowSize(), clientAddress, clientPort);
-                break;
-                
-            case -1: // 窗口外的包，丢弃并发送当前窗口位置
-                sendAck(buffer.getNextSeq() - 1, buffer.getWindowSize(), clientAddress, clientPort);
-                break;
-        }
-    }
-
-    private void startRetransmission(Packet packet, InetAddress address, int port, ConnectionState state) throws IOException {
-        stopRetransmission(state);
-        
-        RetransmissionTask task = new RetransmissionTask(packet, address, port);
-        state.currentRetransmissionTask = task;
-        
-        // 首次发送
-        sendPacket(packet, address, port);
-        
-        // 设置重传定时器
-        task.future = scheduler.scheduleWithFixedDelay(() -> {
-            try {
-                if (task.retries < MAX_RETRIES) {
-                    System.out.println("重传控制包: " + packet.getType() + ", 重试次数: " + (task.retries + 1));
-                    sendPacket(packet, address, port);
-                    task.retries++;
-                    task.incrementTimeout();
-                } else {
-                    System.out.println("重传次数超过限制，关闭连接");
-                    stopRetransmission(state);
-                    cleanup(address.getHostAddress() + ":" + port);
-                }
-            } catch (IOException e) {
-                System.err.println("重传失败: " + e.getMessage());
+    private void handleData(Packet packet, ConnectionState state, InetAddress clientAddress, int clientPort) throws IOException {
+        if (packet.getSeqNum() == state.getExpectedSeqNum()) {
+            // 按序到达的数据包
+            int dataLength = packet.getData() != null ? packet.getData().length : 0;
+            state.setExpectedSeqNum(state.getExpectedSeqNum() + dataLength);  // 更新为数据长度
+            sendACK(packet, clientAddress, clientPort);
+            
+            // 处理数据
+            if (packet.getData() != null) {
+                String message = new String(packet.getData());
+                System.out.println("Received: " + message);
             }
-        }, task.currentTimeout, task.currentTimeout, TimeUnit.MILLISECONDS);
-    }
-
-    private void stopRetransmission(ConnectionState state) {
-        if (state.currentRetransmissionTask != null && state.currentRetransmissionTask.future != null) {
-            state.currentRetransmissionTask.future.cancel(false);
-            state.currentRetransmissionTask = null;
+        } else {
+            // 乱序到达的数据包，重发上一个ACK
+            sendACK(packet, clientAddress, clientPort);
         }
     }
 
-    private void scheduleTimeWait(String clientId) {
-        ConnectionState state = connectionStates.get(clientId);
-        if (state != null && state.timeWaitTimer == null) {
-            state.timeWaitTimer = scheduler.schedule(() -> {
-                System.out.println("TIME_WAIT超时，关闭连接");
-                cleanup(clientId);
-                return null;
-            }, 2 * MSL, TimeUnit.MILLISECONDS);
+    private void sendACK(Packet receivedPacket, InetAddress clientAddress, int clientPort) throws IOException {
+        // 计算正确的ACK号：序列号 + 数据长度
+        int dataLength = receivedPacket.getData() != null ? receivedPacket.getData().length : 0;
+        if (receivedPacket.isSYN() || receivedPacket.isFIN()) {
+            dataLength = 1;  // SYN和FIN包占用一个序列号
         }
+        int ackNum = receivedPacket.getSeqNum() + dataLength;
+
+        Packet ackPacket = Packet.createData(
+            port,
+            clientPort,
+            receivedPacket.getAckNum(),  // 使用收到的ACK号作为序列号
+            ackNum,  // 使用计算出的ACK号
+            null,
+            WINDOW_SIZE
+        );
+        sendPacket(ackPacket, clientAddress, clientPort);
     }
 
-    private void cleanup(String clientId) {
-        ConnectionState state = connectionStates.remove(clientId);
-        if (state != null) {
-            state.cancelTimers();
-        }
-        receiveBuffers.remove(clientId);  // 清理接收缓冲区
+    private void sendFIN(InetAddress clientAddress, int clientPort) throws IOException {
+        Packet finPacket = Packet.createFIN(
+            port,
+            clientPort,
+            0,  // 序列号在实际实现中应该是当前的序列号
+            0,  // ACK number
+            WINDOW_SIZE
+        );
+        sendPacket(finPacket, clientAddress, clientPort);
     }
 
     private void sendPacket(Packet packet, InetAddress address, int port) throws IOException {
         byte[] data = packet.toBytes();
         DatagramPacket datagramPacket = new DatagramPacket(data, data.length, address, port);
         socket.send(datagramPacket);
-    }
-
-    private void sendAck(int seqNum, int windowSize, InetAddress address, int port) throws IOException {
-        Packet ackPacket = new Packet(Packet.TYPE_ACK, seqNum, null, false, windowSize);
-        sendPacket(ackPacket, address, port);
-        System.out.println("发送ACK，序号: " + seqNum + "，窗口大小: " + windowSize);
     }
 
     public void stop() {
@@ -306,8 +331,11 @@ public class ReliableUDPServer {
         }
     }
 
-    public static void main(String[] args) throws IOException {
-        ReliableUDPServer server = new ReliableUDPServer(9876);
-        server.start();
+    private void cleanup(String clientId) {
+        ConnectionState state = connectionStates.remove(clientId);
+        if (state != null) {
+            state.cancelTimers();
+        }
+        receiveBuffers.remove(clientId);  // 清理接收缓冲区
     }
 }
