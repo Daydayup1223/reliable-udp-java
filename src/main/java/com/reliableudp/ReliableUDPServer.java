@@ -2,8 +2,7 @@ package com.reliableudp;
 
 import java.io.IOException;
 import java.net.*;
-import java.util.Arrays;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.*;
 
 public class ReliableUDPServer {
@@ -50,13 +49,23 @@ public class ReliableUDPServer {
         ScheduledFuture<?> timeWaitTimer;
         RetransmissionTask currentRetransmissionTask;
         long lastActivityTime;
-        int nextSeqNum;
-        int expectedSeqNum;
+        int sendNextSeqNum;  // 下一个要发送的序列号
+        int recvExpectedSeqNum;  // 期望收到的序列号
+        int sendUnackedSeqNum;  // 最早未确认的序列号
         private static final long MSL = 2000; // 2 seconds
+        private final Map<Integer, Packet> unackedPackets;  // 未确认的数据包
+        private final TreeMap<Integer, byte[]> receiveBuffer;  // 接收缓冲区，用于存储乱序到达的数据包
+        private static final int RECEIVE_WINDOW_SIZE = 1024;  // 接收窗口大小
+        private int receiveWindowSize;
 
         ConnectionState() {
             this.state = State.LISTEN;  // 服务器端初始状态为LISTEN
             this.lastActivityTime = System.currentTimeMillis();
+            this.sendNextSeqNum = (int) (Math.random() * Integer.MAX_VALUE);  // 随机初始序列号
+            this.sendUnackedSeqNum = this.sendNextSeqNum;
+            this.unackedPackets = new ConcurrentHashMap<>();
+            this.receiveBuffer = new TreeMap<>();
+            this.receiveWindowSize = RECEIVE_WINDOW_SIZE;
         }
 
         public synchronized State getState() {
@@ -91,20 +100,49 @@ public class ReliableUDPServer {
             }
         }
 
-        public int getNextSeqNum() {
-            return nextSeqNum;
+        public synchronized void addToReceiveBuffer(int seqNum, byte[] data) {
+            // 只有在接收窗口内的数据包才会被缓存
+            if (seqNum >= recvExpectedSeqNum && 
+                seqNum < recvExpectedSeqNum + receiveWindowSize) {
+                receiveBuffer.put(seqNum, data);
+            }
         }
 
-        public void setNextSeqNum(int nextSeqNum) {
-            this.nextSeqNum = nextSeqNum;
+        public synchronized List<byte[]> processReceiveBuffer() {
+            List<byte[]> orderedData = new ArrayList<>();
+            
+            // 尝试按序处理缓冲区中的数据
+            while (!receiveBuffer.isEmpty()) {
+                Map.Entry<Integer, byte[]> firstEntry = receiveBuffer.firstEntry();
+                if (firstEntry.getKey() == recvExpectedSeqNum) {
+                    // 找到期望的序列号
+                    orderedData.add(firstEntry.getValue());
+                    receiveBuffer.remove(firstEntry.getKey());
+                    recvExpectedSeqNum += firstEntry.getValue().length;
+                } else {
+                    // 遇到空隙，停止处理
+                    break;
+                }
+            }
+            
+            return orderedData;
         }
 
-        public int getExpectedSeqNum() {
-            return expectedSeqNum;
+        public synchronized int getReceiveWindowSize() {
+            // 计算当前可用的接收窗口大小
+            int bufferedDataSize = 0;
+            for (byte[] data : receiveBuffer.values()) {
+                bufferedDataSize += data.length;
+            }
+            return Math.max(0, receiveWindowSize - bufferedDataSize);
         }
 
-        public void setExpectedSeqNum(int expectedSeqNum) {
-            this.expectedSeqNum = expectedSeqNum;
+        public synchronized Map<Integer, byte[]> getReceiveBuffer() {
+            return receiveBuffer;
+        }
+
+        public void updateLastActivityTime() {
+            this.lastActivityTime = System.currentTimeMillis();
         }
     }
 
@@ -130,10 +168,12 @@ public class ReliableUDPServer {
     }
 
     public void start() throws IOException {
+        System.out.println("Server started on port " + port);
+        System.out.println("================================================");
+
         try {
             socket.setSoTimeout(100); // 使用较短的超时以便及时处理所有类型的包
             running = true;
-            System.out.println("Server started on port " + port);
 
             while (running) {
                 try {
@@ -152,7 +192,9 @@ public class ReliableUDPServer {
                     System.out.println("收到数据包：type=" + packet.getType() + ", from=" + 
                                      datagramPacket.getAddress() + ":" + datagramPacket.getPort());
 
-                    handlePacket(packet, datagramPacket.getAddress(), datagramPacket.getPort());
+                    String clientKey = datagramPacket.getAddress().getHostAddress() + ":" + datagramPacket.getPort();
+                    ConnectionState state = connectionStates.computeIfAbsent(clientKey, k -> new ConnectionState());
+                    handlePacket(packet, clientKey, state, datagramPacket.getAddress(), datagramPacket.getPort());
 
                 } catch (SocketTimeoutException e) {
                     // 正常超时，继续循环
@@ -176,46 +218,37 @@ public class ReliableUDPServer {
         }
     }
 
-    private void handlePacket(Packet packet, InetAddress clientAddress, int clientPort) throws IOException {
-        String clientKey = clientAddress.getHostAddress() + ":" + clientPort;
-        ConnectionState state = connectionStates.computeIfAbsent(clientKey, k -> new ConnectionState());
+    private void handlePacket(Packet packet, String clientKey, ConnectionState state, InetAddress clientAddress, int clientPort) throws IOException {
+        state.updateLastActivityTime();
 
         switch (state.getState()) {
             case LISTEN:
-                if (packet.getType() == Packet.TYPE_SYN) {
+                if (packet.isSYN() && !packet.isACK()) {
                     handleSYN(packet, state, clientAddress, clientPort);
                 }
                 break;
 
             case SYN_RCVD:
-                if (packet.isACK() && !packet.isSYN() && packet.getAckNum() == state.getNextSeqNum()) {
+                if (packet.isACK() && !packet.isSYN() && packet.getAckNum() == state.sendNextSeqNum) {
                     state.setState(State.ESTABLISHED);
                     System.out.println("Connection established with " + clientKey);
+                    System.out.println("================================================");
                 }
                 break;
 
             case ESTABLISHED:
                 if (packet.getType() == Packet.TYPE_FIN) {
-                    // 收到FIN，进入CLOSE_WAIT状态
-                    state.setState(State.CLOSE_WAIT);
-                    // 发送ACK
-                    sendACK(packet, clientAddress, clientPort);
-                    // 发送FIN
-                    sendFIN(clientAddress, clientPort);
-                    state.setState(State.LAST_ACK);
+                    handleFIN(packet, state, clientAddress, clientPort);
                 } else if (packet.getType() == Packet.TYPE_DATA) {
                     handleData(packet, state, clientAddress, clientPort);
                 }
                 break;
 
-            case CLOSE_WAIT:
-                // 等待应用层关闭
-                break;
-
             case LAST_ACK:
                 if (packet.isACK()) {
                     state.setState(State.CLOSED);
-                    cleanup(clientKey);
+                    System.out.println("Connection closed with " + clientKey);
+                    connectionStates.remove(clientKey);
                 }
                 break;
 
@@ -224,13 +257,13 @@ public class ReliableUDPServer {
                     state.setState(State.FIN_WAIT2);
                 } else if (packet.getType() == Packet.TYPE_FIN) {
                     state.setState(State.CLOSING);
-                    sendACK(packet, clientAddress, clientPort);
+                    sendACK(packet, state, clientAddress, clientPort);
                 }
                 break;
 
             case FIN_WAIT2:
                 if (packet.getType() == Packet.TYPE_FIN) {
-                    sendACK(packet, clientAddress, clientPort);
+                    sendACK(packet, state, clientAddress, clientPort);
                     state.setState(State.TIME_WAIT);
                 }
                 break;
@@ -248,11 +281,16 @@ public class ReliableUDPServer {
     }
 
     private void handleSYN(Packet packet, ConnectionState state, InetAddress clientAddress, int clientPort) throws IOException {
+        if (state.getState() != State.LISTEN) {
+            return;
+        }
+
+        // 处理 SYN 包
         int clientSeqNum = packet.getSeqNum();
         int serverInitSeqNum = (int) (Math.random() * Integer.MAX_VALUE);
         
-        state.setNextSeqNum(serverInitSeqNum + 1);
-        state.setExpectedSeqNum(clientSeqNum + 1);
+        state.sendNextSeqNum = serverInitSeqNum + 1;
+        state.recvExpectedSeqNum = clientSeqNum + 1;
         state.setState(State.SYN_RCVD);
 
         // 发送 SYN-ACK
@@ -266,58 +304,196 @@ public class ReliableUDPServer {
         sendPacket(synAckPacket, clientAddress, clientPort);
     }
 
+    private void handleFIN(Packet packet, ConnectionState state, InetAddress clientAddress, int clientPort) throws IOException {
+        // 发送ACK
+        sendACK(packet, state, clientAddress, clientPort);
+
+        // 发送FIN
+        Packet finPacket = Packet.createFIN(
+            port,
+            clientPort,
+            state.sendNextSeqNum,
+            state.recvExpectedSeqNum,
+            WINDOW_SIZE
+        );
+        sendPacket(finPacket, clientAddress, clientPort);
+        state.setState(State.LAST_ACK);
+    }
+
     private void handleData(Packet packet, ConnectionState state, InetAddress clientAddress, int clientPort) throws IOException {
-        if (packet.getSeqNum() == state.getExpectedSeqNum()) {
+        if (packet.getSeqNum() == state.recvExpectedSeqNum) {
             // 按序到达的数据包
             int dataLength = packet.getData() != null ? packet.getData().length : 0;
-            state.setExpectedSeqNum(state.getExpectedSeqNum() + dataLength);  // 更新为数据长度
-            sendACK(packet, clientAddress, clientPort);
+            state.recvExpectedSeqNum += dataLength;  // 更新为数据长度
+            sendACK(packet, state, clientAddress, clientPort);
             
             // 处理数据
             if (packet.getData() != null) {
                 String message = new String(packet.getData());
-                System.out.println("Received: " + message);
+                System.out.println("Received in order: " + message);
+                printReceiveBufferStatus(state);
             }
+        } else if (packet.getSeqNum() > state.recvExpectedSeqNum) {
+            // 乱序到达的数据包，缓存它，但不更新 recvExpectedSeqNum
+            if (packet.getData() != null) {
+                state.addToReceiveBuffer(packet.getSeqNum(), packet.getData());
+                System.out.println("Buffered out-of-order packet with seqNum: " + packet.getSeqNum());
+                System.out.println("Expected seqNum: " + state.recvExpectedSeqNum);
+                printReceiveBufferStatus(state);
+            }
+            // 重发上一个 ACK，表明我们还在等待 recvExpectedSeqNum
+            Packet ackPacket = Packet.createData(
+                port,
+                clientPort,
+                state.sendNextSeqNum,
+                state.recvExpectedSeqNum,  // 使用当前期望的序列号
+                null,
+                state.getReceiveWindowSize()
+            );
+            sendPacket(ackPacket, clientAddress, clientPort);
         } else {
-            // 乱序到达的数据包，重发上一个ACK
-            sendACK(packet, clientAddress, clientPort);
+            // 收到重复的数据包，重发 ACK
+            sendACK(packet, state, clientAddress, clientPort);
+            printReceiveBufferStatus(state);
+        }
+
+        // 尝试处理缓冲区中的数据包
+        processReceiveBuffer(state, clientAddress, clientPort);
+    }
+
+    private void printReceiveBufferStatus(ConnectionState state) {
+        System.out.println("\n接收窗口状态：");
+        System.out.println("----------------------------------------");
+        System.out.println("RCV.NXT = " + state.recvExpectedSeqNum);
+        
+        // 打印缓存内容
+        System.out.println("缓存区内容：");
+        Map<Integer, byte[]> buffer = state.getReceiveBuffer();
+        if (buffer.isEmpty()) {
+            System.out.println("  [空]");
+        } else {
+            // 计算区间
+            TreeMap<Integer, byte[]> sortedBuffer = new TreeMap<>(buffer);
+            int start = -1, end = -1;
+            int lastSeq = -1;
+            int lastLength = 0;
+            
+            for (Map.Entry<Integer, byte[]> entry : sortedBuffer.entrySet()) {
+                int currentSeq = entry.getKey();
+                byte[] data = entry.getValue();
+                
+                if (start == -1) {
+                    // 第一个区间的开始
+                    start = currentSeq;
+                    lastSeq = currentSeq;
+                    lastLength = data.length;
+                } else if (currentSeq == lastSeq + lastLength) {
+                    // 连续的序号
+                    lastSeq = currentSeq;
+                    lastLength = data.length;
+                } else {
+                    // 遇到不连续的序号，输出当前区间
+                    end = lastSeq + lastLength - 1;
+                    System.out.printf("  区间[%d-%d]: ", start, end);
+                    printDataInRange(sortedBuffer, start, end);
+                    
+                    // 开始新的区间
+                    start = currentSeq;
+                    lastSeq = currentSeq;
+                    lastLength = data.length;
+                }
+            }
+            
+            // 输出最后一个区间
+            if (start != -1) {
+                end = lastSeq + lastLength - 1;
+                System.out.printf("  区间[%d-%d]: ", start, end);
+                printDataInRange(sortedBuffer, start, end);
+            }
+        }
+        System.out.println("----------------------------------------");
+    }
+
+    private void printDataInRange(TreeMap<Integer, byte[]> buffer, int start, int end) {
+        StringBuilder content = new StringBuilder();
+        int currentSeq = start;
+        
+        while (currentSeq <= end) {
+            byte[] data = buffer.get(currentSeq);
+            if (data != null) {
+                if (content.length() > 0) {
+                    content.append(" | ");
+                }
+                content.append(new String(data));
+                currentSeq += data.length;
+            } else {
+                currentSeq++;
+            }
+        }
+        
+        System.out.println(content.toString());
+    }
+
+    private void processReceiveBuffer(ConnectionState state, InetAddress clientAddress, int clientPort) throws IOException {
+        List<byte[]> orderedData = state.processReceiveBuffer();
+        if (!orderedData.isEmpty()) {
+            System.out.println("Processing ordered data from buffer:");
+            System.out.println("----------------------------------------");
+        }
+        for (byte[] data : orderedData) {
+            String message = new String(data);
+            System.out.println("Processed from buffer: " + message);
+            
+            // 发送回显响应
+            String response = "Server received: " + message;
+            sendData(response.getBytes(), state, clientAddress, clientPort);
+        }
+        if (!orderedData.isEmpty()) {
+            System.out.println("----------------------------------------");
+            printReceiveBufferStatus(state);
         }
     }
 
-    private void sendACK(Packet receivedPacket, InetAddress clientAddress, int clientPort) throws IOException {
-        // 计算正确的ACK号：序列号 + 数据长度
+    private void sendACK(Packet receivedPacket, ConnectionState state, InetAddress clientAddress, int clientPort) throws IOException {
+        // 计算ACK号：序列号 + 数据长度
         int dataLength = receivedPacket.getData() != null ? receivedPacket.getData().length : 0;
         if (receivedPacket.isSYN() || receivedPacket.isFIN()) {
             dataLength = 1;  // SYN和FIN包占用一个序列号
         }
-        int ackNum = receivedPacket.getSeqNum() + dataLength;
+
+        // 如果是乱序数据包，使用期望的序列号作为 ACK
+        int ackNum = receivedPacket.getSeqNum() < state.recvExpectedSeqNum ? 
+                    state.recvExpectedSeqNum : 
+                    receivedPacket.getSeqNum() + dataLength;
 
         Packet ackPacket = Packet.createData(
             port,
             clientPort,
-            receivedPacket.getAckNum(),  // 使用收到的ACK号作为序列号
-            ackNum,  // 使用计算出的ACK号
+            state.sendNextSeqNum,
+            ackNum,
             null,
-            WINDOW_SIZE
+            state.getReceiveWindowSize()
         );
         sendPacket(ackPacket, clientAddress, clientPort);
-    }
-
-    private void sendFIN(InetAddress clientAddress, int clientPort) throws IOException {
-        Packet finPacket = Packet.createFIN(
-            port,
-            clientPort,
-            0,  // 序列号在实际实现中应该是当前的序列号
-            0,  // ACK number
-            WINDOW_SIZE
-        );
-        sendPacket(finPacket, clientAddress, clientPort);
     }
 
     private void sendPacket(Packet packet, InetAddress address, int port) throws IOException {
         byte[] data = packet.toBytes();
         DatagramPacket datagramPacket = new DatagramPacket(data, data.length, address, port);
         socket.send(datagramPacket);
+    }
+
+    private void sendData(byte[] data, ConnectionState state, InetAddress clientAddress, int clientPort) throws IOException {
+        Packet dataPacket = Packet.createData(
+            port,
+            clientPort,
+            state.sendNextSeqNum,  // 使用我们自己的序列号
+            state.recvExpectedSeqNum,  // ACK number
+            data,
+            state.getReceiveWindowSize()  // 通告当前可用的接收窗口大小
+        );
+        sendPacket(dataPacket, clientAddress, clientPort);
+        state.sendNextSeqNum += data.length;
     }
 
     public void stop() {

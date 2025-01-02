@@ -7,6 +7,11 @@ import java.util.concurrent.*;
 import java.util.Map;
 import java.util.HashMap;
 import java.util.Arrays;
+import java.util.TreeMap;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Iterator;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class ReliableUDPClient {
     private final DatagramSocket socket;
@@ -15,23 +20,25 @@ public class ReliableUDPClient {
     private final ScheduledExecutorService scheduler;
     private volatile boolean running;
     private State state;
-    private int nextSeqNum;
-    private int expectedSeqNum;
+    private int sendNextSeqNum;  // 下一个要发送的序列号
+    private int recvExpectedSeqNum;  // 期望收到的序列号
+    private int sendUnackedSeqNum;  // 最早未确认的序列号
     private static final int WINDOW_SIZE = 5;
-    private static final int INITIAL_TIMEOUT = 1000; // 初始RTO为1秒
+    private static final int INITIAL_TIMEOUT = 1000;
     private static final int MAX_RETRIES = 5;
     private ScheduledFuture<?> timeWaitTimer;
-    private static final long MSL = 2000; // 2 seconds
+    private static final long MSL = 2000;
     private int localPort;
-    
-    // RTT和RTO相关的变量
-    private double estimatedRTT = 0;    // 预估的RTT
-    private double devRTT = 0;          // RTT偏差
-    private int RTO = INITIAL_TIMEOUT;   // 当前的超时时间
-    private static final double ALPHA = 0.125;  // RTT平滑因子
-    private static final double BETA = 0.25;    // 偏差平滑因子
-    private Map<Integer, Long> sendTimes;       // 记录发送时间
-    private Map<Integer, ScheduledFuture<?>> retransmissionTimers; // 重传定时器
+    private double estimatedRTT = 0;
+    private double devRTT = 0;
+    private int RTO = INITIAL_TIMEOUT;
+    private static final double ALPHA = 0.125;
+    private static final double BETA = 0.25;
+    private Map<Integer, Long> sendTimes;
+    private Map<Integer, ScheduledFuture<?>> retransmissionTimers;
+    private Map<Integer, Packet> unackedPackets;  // 未确认的数据包
+    private final TreeMap<Integer, byte[]> receiveBuffer;  // 接收缓冲区
+    private static final int RECEIVE_WINDOW_SIZE = 1024;  // 接收窗口大小
 
     public enum State {
         CLOSED,
@@ -54,6 +61,208 @@ public class ReliableUDPClient {
         this.localPort = socket.getLocalPort();
         this.sendTimes = new HashMap<>();
         this.retransmissionTimers = new HashMap<>();
+        this.unackedPackets = new ConcurrentHashMap<>();
+        this.receiveBuffer = new TreeMap<>();
+        this.sendNextSeqNum = (int) (Math.random() * Integer.MAX_VALUE);  // 随机初始序列号
+        this.sendUnackedSeqNum = this.sendNextSeqNum;
+        this.recvExpectedSeqNum = 0;
+    }
+
+    private synchronized void addToReceiveBuffer(int seqNum, byte[] data) {
+        // 只有在接收窗口内的数据包才会被缓存
+        if (seqNum >= recvExpectedSeqNum && 
+            seqNum < recvExpectedSeqNum + RECEIVE_WINDOW_SIZE) {
+            receiveBuffer.put(seqNum, data);
+        }
+    }
+
+    private synchronized List<byte[]> processReceiveBuffer() {
+        List<byte[]> orderedData = new ArrayList<>();
+        
+        // 尝试按序处理缓冲区中的数据
+        while (!receiveBuffer.isEmpty()) {
+            Map.Entry<Integer, byte[]> firstEntry = receiveBuffer.firstEntry();
+            if (firstEntry.getKey() == recvExpectedSeqNum) {
+                // 找到期望的序列号
+                orderedData.add(firstEntry.getValue());
+                receiveBuffer.remove(firstEntry.getKey());
+                recvExpectedSeqNum += firstEntry.getValue().length;
+            } else {
+                // 遇到空隙，停止处理
+                break;
+            }
+        }
+        
+        return orderedData;
+    }
+
+    private synchronized int getReceiveWindowSize() {
+        // 计算当前可用的接收窗口大小
+        int bufferedDataSize = 0;
+        for (byte[] data : receiveBuffer.values()) {
+            bufferedDataSize += data.length;
+        }
+        return Math.max(0, RECEIVE_WINDOW_SIZE - bufferedDataSize);
+    }
+
+    private void handleData(Packet packet) throws IOException {
+        // 处理接收到的数据
+        if (packet.getData() != null) {
+            // 检查序列号是否在接收窗口范围内
+            if (packet.getSeqNum() >= recvExpectedSeqNum && 
+                packet.getSeqNum() < recvExpectedSeqNum + RECEIVE_WINDOW_SIZE) {
+                
+                // 将数据添加到接收缓冲区
+                addToReceiveBuffer(packet.getSeqNum(), packet.getData());
+                
+                // 处理缓冲区中的有序数据
+                List<byte[]> orderedData = processReceiveBuffer();
+                for (byte[] data : orderedData) {
+                    String message = new String(data);
+                    System.out.println("Received in order: " + message);
+                }
+            }
+        }
+
+        // 处理ACK
+        if (packet.isACK()) {
+            int ackNum = packet.getAckNum();
+            // 确认数据包
+            for (Iterator<Map.Entry<Integer, Packet>> it = unackedPackets.entrySet().iterator(); it.hasNext();) {
+                Map.Entry<Integer, Packet> entry = it.next();
+                if (entry.getKey() < ackNum) {
+                    it.remove();
+                    // 取消对应的重传定时器
+                    cancelRetransmissionTimer(entry.getKey());
+                }
+            }
+            // 更新RTT
+            updateRTT(ackNum);
+        }
+
+        // 发送ACK（可以捎带数据）
+        sendACK(packet);
+    }
+
+    public void send(byte[] data) throws IOException {
+        if (state != State.ESTABLISHED) {
+            throw new IOException("Connection not established");
+        }
+
+        Packet dataPacket = Packet.createData(
+            localPort,
+            serverPort,
+            sendNextSeqNum,
+            recvExpectedSeqNum,  // 捎带ACK
+            data,
+            getReceiveWindowSize()  // 通告当前可用的接收窗口大小
+        );
+
+        // 更新发送序列号
+        sendNextSeqNum += data.length;
+        
+        // 记录未确认的包
+        unackedPackets.put(sendNextSeqNum, dataPacket);
+        
+        // 发送数据包
+        sendWithRTO(dataPacket);
+    }
+
+    // 乱序发送数据
+    public void sendOutOfOrder(byte[][] dataChunks, long[] delays) throws IOException {
+        if (state != State.ESTABLISHED) {
+            throw new IOException("Connection not established");
+        }
+
+        if (dataChunks.length != delays.length) {
+            throw new IllegalArgumentException("Data chunks and delays arrays must have the same length");
+        }
+
+        // 创建发送线程
+        Thread[] sendThreads = new Thread[dataChunks.length];
+        for (int i = 0; i < dataChunks.length; i++) {
+            final int index = i;
+            final byte[] data = dataChunks[index];
+            final long delay = delays[index];
+
+            sendThreads[i] = new Thread(() -> {
+                try {
+                    // 等待指定的延迟时间
+                    Thread.sleep(delay);
+
+                    // 创建数据包
+                    Packet dataPacket = Packet.createData(
+                        localPort,
+                        serverPort,
+                        sendNextSeqNum + calculateOffset(index, dataChunks),
+                        recvExpectedSeqNum,
+                        data,
+                        getReceiveWindowSize()
+                    );
+
+                    // 记录未确认的包
+                    synchronized (this) {
+                        unackedPackets.put(sendNextSeqNum + calculateOffset(index, dataChunks), dataPacket);
+                    }
+
+                    // 发送数据包
+                    sendWithRTO(dataPacket);
+                    System.out.println("Sent chunk " + index + " with delay " + delay + "ms");
+
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+            });
+        }
+
+        // 启动所有发送线程
+        for (Thread thread : sendThreads) {
+            thread.start();
+        }
+
+        // 等待所有线程完成
+        for (Thread thread : sendThreads) {
+            try {
+                thread.join();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted while sending out of order packets", e);
+            }
+        }
+
+        // 更新发送序列号
+        int totalLength = 0;
+        for (byte[] chunk : dataChunks) {
+            totalLength += chunk.length;
+        }
+        sendNextSeqNum += totalLength;
+    }
+
+    // 计算每个数据块的序列号偏移
+    private int calculateOffset(int index, byte[][] dataChunks) {
+        int offset = 0;
+        for (int i = 0; i < index; i++) {
+            offset += dataChunks[i].length;
+        }
+        return offset;
+    }
+
+    private void sendACK(Packet receivedPacket) throws IOException {
+        // 计算ACK号：序列号 + 数据长度
+        int dataLength = receivedPacket.getData() != null ? receivedPacket.getData().length : 0;
+        if (receivedPacket.isSYN() || receivedPacket.isFIN()) {
+            dataLength = 1;
+        }
+
+        Packet ackPacket = Packet.createData(
+            localPort,
+            serverPort,
+            sendNextSeqNum,  // 使用我们自己的序列号
+            receivedPacket.getSeqNum() + dataLength,  // 确认收到的数据
+            null,
+            getReceiveWindowSize()  // 通告当前可用的接收窗口大小
+        );
+        send(ackPacket);
     }
 
     // 更新RTT和RTO
@@ -120,36 +329,34 @@ public class ReliableUDPClient {
 
     public void connect() throws IOException {
         if (state != State.CLOSED) {
-            throw new IllegalStateException("Client must be in CLOSED state to connect");
+            throw new IllegalStateException("Already connected or connecting");
         }
 
-        // 生成初始序列号
-        Random random = new Random();
-        nextSeqNum = random.nextInt(10000);
-
-        // 发送 SYN
+        // 发送SYN
+        state = State.SYN_SENT;
         Packet synPacket = Packet.createSYN(
             socket.getLocalPort(),
             serverPort,
-            nextSeqNum,
+            sendNextSeqNum,
             WINDOW_SIZE
         );
         sendWithRTO(synPacket);
-        state = State.SYN_SENT;
 
         // 等待连接建立
         waitForConnection();
     }
 
     private void waitForConnection() throws IOException {
-        while (state != State.ESTABLISHED && state != State.CLOSED) {
+        long startTime = System.currentTimeMillis();
+        long timeout = 5000; // 5秒超时
+
+        while (state != State.ESTABLISHED && System.currentTimeMillis() - startTime < timeout) {
             try {
                 byte[] receiveData = new byte[1024];
                 DatagramPacket receivePacket = new DatagramPacket(receiveData, receiveData.length);
-                socket.setSoTimeout(INITIAL_TIMEOUT);
+                socket.setSoTimeout(1000); // 1秒超时
                 socket.receive(receivePacket);
 
-                // 只使用实际接收到的数据
                 byte[] actualData = Arrays.copyOf(receivePacket.getData(), receivePacket.getLength());
                 Packet packet = Packet.fromBytes(actualData);
                 if (packet != null) {
@@ -157,47 +364,41 @@ public class ReliableUDPClient {
                 }
             } catch (SocketTimeoutException e) {
                 // 超时继续等待
+                continue;
             }
+        }
+
+        if (state != State.ESTABLISHED) {
+            state = State.CLOSED;
+            throw new IOException("Connection establishment failed");
         }
     }
 
     private void handlePacket(Packet packet) throws IOException {
-        // 处理确认
-        if (packet.getFlags() == Packet.FLAG_ACK) {
-            int ackNum = packet.getAckNum();
-            // 更新RTT
-            Long sendTime = sendTimes.get(ackNum);
-            if (sendTime != null) {
-                updateRTT(ackNum);
-                // 立即取消重传定时器
-                cancelRetransmissionTimer(ackNum);
-                System.out.println("收到ACK " + ackNum + "，取消重传定时器");
-            }
-        }
+        System.out.println("Client received packet: type=" + packet.getType() + 
+                         ", flags=" + packet.getFlags() + 
+                         ", seqNum=" + packet.getSeqNum() + 
+                         ", ackNum=" + packet.getAckNum());
 
         switch (state) {
             case SYN_SENT:
-                if (packet.getType() == Packet.TYPE_SYN_ACK) {
+                if (packet.isSYN() && packet.isACK()) {
                     handleConnectionResponse(packet);
                 }
                 break;
 
             case ESTABLISHED:
                 if (packet.getType() == Packet.TYPE_FIN) {
-                    // 收到FIN，进入CLOSE_WAIT状态
-                    state = State.CLOSE_WAIT;
-                    sendACK(packet);
-                } else if (packet.getType() == Packet.TYPE_DATA && packet.getFlags() == Packet.FLAG_ACK) {
-                    // 处理数据确认
-                    updateRTT(packet.getAckNum());
+                    handleFIN(packet);
+                } else if (packet.getType() == Packet.TYPE_DATA) {
+                    handleData(packet);
                 }
                 break;
 
             case FIN_WAIT1:
-                if (packet.getType() == Packet.TYPE_ACK) {
+                if (packet.isACK()) {
                     state = State.FIN_WAIT2;
                 } else if (packet.getType() == Packet.TYPE_FIN) {
-                    // 同时关闭的情况
                     state = State.CLOSING;
                     sendACK(packet);
                 }
@@ -206,79 +407,56 @@ public class ReliableUDPClient {
             case FIN_WAIT2:
                 if (packet.getType() == Packet.TYPE_FIN) {
                     sendACK(packet);
+                    state = State.TIME_WAIT;
                     startTimeWaitTimer();
                 }
                 break;
 
             case CLOSING:
-                if (packet.getType() == Packet.TYPE_ACK) {
+                if (packet.isACK()) {
+                    state = State.TIME_WAIT;
                     startTimeWaitTimer();
-                }
-                break;
-
-            case LAST_ACK:
-                if (packet.getType() == Packet.TYPE_ACK) {
-                    state = State.CLOSED;
-                    cleanup();
                 }
                 break;
         }
     }
 
     private void handleConnectionResponse(Packet packet) throws IOException {
-        if (packet.getType() == Packet.TYPE_SYN_ACK) {
-            expectedSeqNum = packet.getNextSeqNum();
-            nextSeqNum++;
+        if (packet.isSYN() && packet.isACK()) {
+            recvExpectedSeqNum = packet.getSeqNum() + 1;
+            sendNextSeqNum++;
 
             // 发送 ACK
             Packet ackPacket = Packet.createData(
                 socket.getLocalPort(),
                 serverPort,
-                nextSeqNum,
-                expectedSeqNum,
+                sendNextSeqNum,
+                recvExpectedSeqNum,
                 null,
                 WINDOW_SIZE
             );
-            sendWithRTO(ackPacket);
+            send(ackPacket);
             state = State.ESTABLISHED;
+            System.out.println("Connection established");
         }
     }
 
-    private void handleData(Packet packet) throws IOException {
-        if (packet.getSeqNum() == expectedSeqNum) {
-            expectedSeqNum++;
-            sendACK(packet);
-            
-            if (packet.getData() != null) {
-                String message = new String(packet.getData());
-                System.out.println("Received: " + message);
-            }
-        } else {
-            sendACK(packet);
-        }
-    }
-
-    public void send(byte[] data) throws IOException {
-        if (state != State.ESTABLISHED) {
-            throw new IllegalStateException("Connection not established");
-        }
-
-        Packet packet = Packet.createData(
-            socket.getLocalPort(),
-            serverPort,
-            nextSeqNum,
-            expectedSeqNum,
-            data,
-            WINDOW_SIZE
-        );
-        sendWithRTO(packet);
-        nextSeqNum++;
-    }
-
-    public void disconnect() throws IOException {
-        if (state == State.ESTABLISHED) {
-            sendFIN();
-            waitForDisconnection();
+    private void handleFIN(Packet packet) throws IOException {
+        switch (state) {
+            case ESTABLISHED:
+                // 收到FIN，进入CLOSE_WAIT状态
+                state = State.CLOSE_WAIT;
+                // 发送ACK
+                Packet ackPacket = Packet.createData(
+                    socket.getLocalPort(),
+                    serverPort,
+                    sendNextSeqNum,
+                    recvExpectedSeqNum,
+                    null,
+                    WINDOW_SIZE
+                );
+                send(ackPacket);
+                break;
         }
     }
 
@@ -286,12 +464,19 @@ public class ReliableUDPClient {
         Packet finPacket = Packet.createFIN(
             localPort,
             serverPort,
-            nextSeqNum,
-            expectedSeqNum,
+            sendNextSeqNum,
+            recvExpectedSeqNum,
             WINDOW_SIZE
         );
         sendWithRTO(finPacket);
         state = State.FIN_WAIT1;
+    }
+
+    public void disconnect() throws IOException {
+        if (state == State.ESTABLISHED) {
+            sendFIN();
+            waitForDisconnection();
+        }
     }
 
     private void waitForDisconnection() throws IOException {
@@ -314,18 +499,6 @@ public class ReliableUDPClient {
         }
     }
 
-    private void sendACK(Packet receivedPacket) throws IOException {
-        Packet ackPacket = Packet.createData(
-            socket.getLocalPort(),
-            serverPort,
-            nextSeqNum,
-            receivedPacket.getSeqNum() + 1,
-            null,
-            WINDOW_SIZE
-        );
-        sendWithRTO(ackPacket);
-    }
-
     private void startTimeWaitTimer() {
         if (timeWaitTimer != null) {
             timeWaitTimer.cancel(false);
@@ -334,6 +507,14 @@ public class ReliableUDPClient {
             state = State.CLOSED;
             cleanup();
         }, 2 * MSL, TimeUnit.MILLISECONDS);
+    }
+
+    private void cleanup() {
+        if (timeWaitTimer != null) {
+            timeWaitTimer.cancel(false);
+        }
+        scheduler.shutdown();
+        socket.close();
     }
 
     private void send(Packet packet) throws IOException {
@@ -345,13 +526,5 @@ public class ReliableUDPClient {
             serverPort
         );
         socket.send(datagramPacket);
-    }
-
-    private void cleanup() {
-        if (timeWaitTimer != null) {
-            timeWaitTimer.cancel(false);
-        }
-        scheduler.shutdown();
-        socket.close();
     }
 }
