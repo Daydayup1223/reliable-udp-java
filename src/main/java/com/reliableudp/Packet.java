@@ -39,6 +39,7 @@ public class Packet implements Serializable {
     private final int urgentPointer;   // 紧急指针 (16位)
     private final byte[] data;         // 数据内容
     private final boolean last;        // 是否为最后一个包
+    private final int rcvWnd;          // 接收窗口大小
 
     /**
      * 创建一个新的数据包
@@ -51,9 +52,10 @@ public class Packet implements Serializable {
      * @param windowSize 接收窗口大小
      * @param data 数据内容
      * @param last 是否为最后一个包
+     * @param rcvWnd 接收窗口大小
      */
     public Packet(int type, int sourcePort, int destPort, int seqNum, int ackNum, 
-                 int flags, int windowSize, byte[] data, boolean last) {
+                 int flags, int windowSize, byte[] data, boolean last, int rcvWnd) {
         this.type = type;
         this.sourcePort = sourcePort;
         this.destPort = destPort;
@@ -66,6 +68,7 @@ public class Packet implements Serializable {
         this.urgentPointer = 0;
         this.data = data;
         this.last = last;
+        this.rcvWnd = rcvWnd;
     }
 
     /**
@@ -76,7 +79,7 @@ public class Packet implements Serializable {
      * @param windowSize 接收窗口大小
      */
     public static Packet createSYN(int sourcePort, int destPort, int initialSeqNum, int windowSize) {
-        return new Packet(TYPE_SYN, sourcePort, destPort, initialSeqNum, 0, FLAG_SYN, windowSize, null, false);
+        return new Packet(TYPE_SYN, sourcePort, destPort, initialSeqNum, 0, FLAG_SYN, windowSize, null, false, windowSize);
     }
 
     /**
@@ -88,7 +91,7 @@ public class Packet implements Serializable {
      * @param windowSize 接收窗口大小
      */
     public static Packet createSYNACK(int sourcePort, int destPort, int initialSeqNum, int ackNum, int windowSize) {
-        return new Packet(TYPE_SYN_ACK, sourcePort, destPort, initialSeqNum, ackNum, FLAG_SYN | FLAG_ACK, windowSize, null, false);
+        return new Packet(TYPE_SYN_ACK, sourcePort, destPort, initialSeqNum, ackNum, FLAG_SYN | FLAG_ACK, windowSize, null, false, windowSize);
     }
 
     /**
@@ -99,9 +102,10 @@ public class Packet implements Serializable {
      * @param ackNum 确认应答号
      * @param data 数据内容
      * @param windowSize 接收窗口大小
+     * @param rcvWnd 接收窗口大小
      */
-    public static Packet createData(int sourcePort, int destPort, int seqNum, int ackNum, byte[] data, int windowSize) {
-        return new Packet(TYPE_DATA, sourcePort, destPort, seqNum, ackNum, FLAG_ACK, windowSize, data, false);
+    public static Packet createData(int sourcePort, int destPort, int seqNum, int ackNum, byte[] data, int windowSize, int rcvWnd) {
+        return new Packet(TYPE_DATA, sourcePort, destPort, seqNum, ackNum, FLAG_ACK, windowSize, data, false, rcvWnd);
     }
 
     /**
@@ -113,7 +117,19 @@ public class Packet implements Serializable {
      * @param windowSize 接收窗口大小
      */
     public static Packet createFIN(int sourcePort, int destPort, int seqNum, int ackNum, int windowSize) {
-        return new Packet(TYPE_FIN, sourcePort, destPort, seqNum, ackNum, FLAG_FIN | FLAG_ACK, windowSize, null, false);
+        return new Packet(TYPE_FIN, sourcePort, destPort, seqNum, ackNum, FLAG_FIN | FLAG_ACK, windowSize, null, false, 0);
+    }
+
+    /**
+     * 创建一个ACK包（确认包）
+     * @param sourcePort 源端口
+     * @param destPort 目标端口
+     * @param seqNum 序列号
+     * @param ackNum 确认应答号
+     * @param windowSize 接收窗口大小
+     */
+    public static Packet createACK(int sourcePort, int destPort, int seqNum, int ackNum, int windowSize) {
+        return new Packet(TYPE_ACK, sourcePort, destPort, seqNum, ackNum, FLAG_ACK, windowSize, null, false, 0);
     }
 
     // 辅助方法：检查控制位
@@ -131,6 +147,7 @@ public class Packet implements Serializable {
     public int getDestPort() { return destPort; }
     public int getWindowSize() { return windowSize; }
     public boolean isLast() { return last; }
+    public int getRcvWnd() { return rcvWnd; }
     
     /**
      * 获取数据长度，用于计算下一个序列号
@@ -219,8 +236,20 @@ public class Packet implements Serializable {
             byte[] data = null;
             int remainingBytes = bytes.length - HEADER_SIZE;  // 只处理实际的数据长度
             if (remainingBytes > 0) {
-                data = new byte[remainingBytes];
-                buffer.get(data);
+                // 检查数据是否全为0（可能是垃圾数据）
+                boolean allZeros = true;
+                for (int i = HEADER_SIZE; i < bytes.length; i++) {
+                    if (bytes[i] != 0) {
+                        allZeros = false;
+                        break;
+                    }
+                }
+                
+                // 只有当数据不全为0时才保存数据
+                if (!allZeros) {
+                    data = new byte[remainingBytes];
+                    buffer.get(data);
+                }
             }
 
             System.out.println("Parsed packet: type=" + type + ", flags=" + flags + 
@@ -230,7 +259,7 @@ public class Packet implements Serializable {
                              ", dataLength=" + (data != null ? data.length : 0));
 
             return new Packet(type, sourcePort, destPort, seqNum, ackNum, 
-                            flags, windowSize, data, last);
+                            flags, windowSize, data, last, 0);
         } catch (Exception e) {
             System.err.println("Error parsing packet: " + e.getMessage());
             e.printStackTrace();
