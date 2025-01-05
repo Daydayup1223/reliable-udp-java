@@ -3,6 +3,7 @@ package com.reliableudp;
 import java.io.IOException;
 import java.net.*;
 import java.util.concurrent.*;
+import java.util.Random;
 
 public class ReliableUDPClient {
     private final DatagramSocket socket;
@@ -37,6 +38,31 @@ public class ReliableUDPClient {
      */
     public void send(byte[] data) throws IOException {
         tcpStateMachine.send(data);
+    }
+
+    /**
+     * 发送数据，可选是否使用随机延迟
+     */
+    public void send(byte[] data, boolean useDelay) throws IOException {
+        tcpStateMachine.send(data, useDelay);
+    }
+
+    /**
+     * 延迟发送数据包
+     */
+    private void sendWithDelay(DatagramPacket packet) {
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        executor.submit(() -> {
+            try {
+                // 随机延迟0-1000ms
+                Thread.sleep(new Random().nextInt(1000));
+                socket.send(packet);
+                System.out.println("延迟发送数据包，大小: " + packet.getLength() + " 字节");
+            } catch (Exception e) {
+                System.err.println("延迟发送失败: " + e.getMessage());
+            }
+        });
+        executor.shutdown();
     }
 
     /**

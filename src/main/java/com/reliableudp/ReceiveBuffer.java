@@ -1,98 +1,172 @@
 package com.reliableudp;
 
+import java.util.Arrays;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.function.Consumer;
 
 public class ReceiveBuffer {
-    private final TreeMap<Integer, byte[]> buffer;  // 有序存储数据包
-    private int expectedSeqNum;                     // 期望的下一个序号
-    private int windowSize;                         // 接收窗口大小
-    private StringBuilder messageBuffer;            // 完整消息缓冲区
+    // TCP协议参数
+    private static final int MAX_WINDOW_SIZE = 65535;  // 最大接收窗口
+    private static final int INITIAL_WINDOW = 1024;    // 初始接收窗口
+    private static final int MSS = 1460;              // Maximum Segment Size
 
-    public ReceiveBuffer(int windowSize) {
-        this.buffer = new TreeMap<>();
-        this.expectedSeqNum = 0;
-        this.windowSize = windowSize;
-        this.messageBuffer = new StringBuilder();
+    // 接收窗口变量
+    private final int irs;              // Initial Receive Sequence number
+    private int rcv_nxt;               // 期望收到的下一个字节序号
+    private int rcv_wnd;               // 接收窗口大小
+    private int rcv_up;                // 紧急指针
+    
+    // 接收缓冲区
+    private final byte[] receiveBuffer;    // 环形缓冲区
+    private int writeIndex;               // 写入位置
+    private int readIndex;                // 读取位置
+    private final TreeMap<Integer, byte[]> outOfOrderBuffer;  // 失序数据缓存
+    
+    // 数据处理回调
+    private final Consumer<byte[]> dataConsumer;
+
+    public ReceiveBuffer(int initialSequenceNumber, Consumer<byte[]> dataConsumer) {
+        // 初始化序列号
+        this.irs = initialSequenceNumber;
+        this.rcv_nxt = initialSequenceNumber;
+        
+        // 初始化窗口
+        this.rcv_wnd = INITIAL_WINDOW;
+        this.rcv_up = 0;
+        
+        // 初始化缓冲区
+        this.receiveBuffer = new byte[MAX_WINDOW_SIZE];
+        this.writeIndex = 0;
+        this.readIndex = 0;
+        this.outOfOrderBuffer = new TreeMap<>();
+        
+        this.dataConsumer = dataConsumer;
     }
 
     /**
-     * 尝试将数据包放入缓冲区
-     * @param seqNum 序列号
-     * @param data 数据
-     * @return true 如果数据包在接收窗口内并成功缓存
+     * 处理接收到的数据段
+     * @return true 如果数据被成功处理
      */
-    public boolean putPacket(int seqNum, byte[] data) {
+    public synchronized boolean processSegment(int seqNum, byte[] data) {
         // 检查序号是否在接收窗口内
-        if (seqNum < expectedSeqNum || seqNum >= expectedSeqNum + windowSize) {
+        if (!isInWindow(seqNum, data.length)) {
             return false;
         }
 
-        // 存储数据包
-        buffer.put(seqNum, data);
-        return true;
-    }
-
-    /**
-     * 处理缓冲区中的有序数据
-     * @return 如果有新的有序数据被处理则返回true
-     */
-    public boolean processOrderedData() {
-        boolean processed = false;
-        
-        // 处理所有连续的数据包
-        while (!buffer.isEmpty() && buffer.firstKey() == expectedSeqNum) {
-            byte[] data = buffer.remove(expectedSeqNum);
-            messageBuffer.append(new String(data));
-            expectedSeqNum++;
-            processed = true;
+        if (seqNum == rcv_nxt) {
+            // 按序到达的数据
+            writeToBuffer(data);
+            rcv_nxt += data.length;
+            
+            // 处理可能的失序数据
+            processOutOfOrderData();
+            
+            // 通知数据可用
+            deliverData();
+            return true;
+        } else if (seqNum > rcv_nxt) {
+            // 失序数据，缓存起来
+            outOfOrderBuffer.put(seqNum, data);
+            return true;
         }
         
-        return processed;
+        return false;
     }
 
     /**
-     * 获取并清空消息缓冲区
-     * @return 完整的消息
+     * 检查序号是否在接收窗口内
      */
-    public String getAndClearMessage() {
-        String message = messageBuffer.toString();
-        messageBuffer.setLength(0);
-        return message;
+    private boolean isInWindow(int seqNum, int length) {
+        // 处理序号回绕
+        int windowEnd = (rcv_nxt + rcv_wnd) & 0xFFFFFFFF;
+        if (rcv_nxt <= windowEnd) {
+            return seqNum >= rcv_nxt && seqNum + length <= windowEnd;
+        } else {
+            return seqNum >= rcv_nxt || seqNum + length <= windowEnd;
+        }
     }
 
     /**
-     * 获取期望的序号
+     * 写入数据到接收缓冲区
      */
-    public int getExpectedSeqNum() {
-        return expectedSeqNum;
+    private void writeToBuffer(byte[] data) {
+        for (byte b : data) {
+            receiveBuffer[writeIndex] = b;
+            writeIndex = (writeIndex + 1) % MAX_WINDOW_SIZE;
+        }
     }
 
     /**
-     * 获取缓冲区中最大的连续序号
+     * 处理失序数据
      */
-    public int getHighestContiguousSeqNum() {
-        return expectedSeqNum - 1;
+    private void processOutOfOrderData() {
+        while (!outOfOrderBuffer.isEmpty()) {
+            Map.Entry<Integer, byte[]> entry = outOfOrderBuffer.firstEntry();
+            if (entry.getKey() != rcv_nxt) {
+                break;
+            }
+            
+            byte[] data = entry.getValue();
+            writeToBuffer(data);
+            rcv_nxt += data.length;
+            outOfOrderBuffer.remove(entry.getKey());
+        }
     }
 
     /**
-     * 获取接收窗口的右边界
+     * 传递数据给应用层
      */
-    public int getWindowEnd() {
-        return expectedSeqNum + windowSize;
+    private void deliverData() {
+        if (readIndex == writeIndex) {
+            return;
+        }
+
+        int available;
+        if (writeIndex > readIndex) {
+            available = writeIndex - readIndex;
+        } else {
+            available = MAX_WINDOW_SIZE - readIndex + writeIndex;
+        }
+
+        byte[] data = new byte[available];
+        int count = 0;
+        while (readIndex != writeIndex) {
+            data[count++] = receiveBuffer[readIndex];
+            readIndex = (readIndex + 1) % MAX_WINDOW_SIZE;
+        }
+
+        if (dataConsumer != null) {
+            dataConsumer.accept(Arrays.copyOf(data, count));
+        }
     }
 
     /**
-     * 检查缓冲区是否为空
+     * 获取当前接收窗口大小
      */
-    public boolean isEmpty() {
-        return buffer.isEmpty();
+    public synchronized int getWindowSize() {
+        return Math.min(MAX_WINDOW_SIZE - ((writeIndex - readIndex + MAX_WINDOW_SIZE) % MAX_WINDOW_SIZE),
+                       rcv_wnd);
     }
 
     /**
-     * 获取缓冲区中的所有序号
+     * 获取下一个期望的序号
      */
-    public String getBufferedSequenceNumbers() {
-        return buffer.keySet().toString();
+    public int getNextExpectedSeqNum() {
+        return rcv_nxt;
+    }
+
+    /**
+     * 获取接收缓冲区状态
+     */
+    @Override
+    public String toString() {
+        return String.format(
+            "ReceiveBuffer[IRS=%d, RCV.NXT=%d, RCV.WND=%d, " +
+            "OutOfOrder=%d, BufferUsage=%d%%]",
+            irs, rcv_nxt, rcv_wnd,
+            outOfOrderBuffer.size(),
+            ((writeIndex - readIndex + MAX_WINDOW_SIZE) % MAX_WINDOW_SIZE) * 100 / MAX_WINDOW_SIZE
+        );
     }
 }
