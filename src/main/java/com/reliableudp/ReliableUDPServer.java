@@ -4,22 +4,19 @@ import java.io.IOException;
 import java.net.*;
 import java.util.concurrent.*;
 
+import com.reliableudp.TCPStateMachine.State;
+
 public class ReliableUDPServer {
     private final DatagramSocket socket;
-    private TCPStateMachine tcpStateMachine;  
     private volatile boolean running;
     private final Thread receiveThread;
-    private InetAddress clientAddress;
-    private int clientPort;
-    private ConcurrentHashMap<String, TCPStateMachine> clients = new ConcurrentHashMap<>();
+    private ConcurrentHashMap<String, TCPStateMachine> clientStates = new ConcurrentHashMap<>();
 
     public ReliableUDPServer(int port) throws IOException {
         try {
             this.socket = new DatagramSocket(port);
             this.running = false;
             this.receiveThread = new Thread(this::receiveLoop);
-            // 初始化为null，等待客户端连接时设置
-            this.tcpStateMachine = null;
         } catch (Exception e) {
             System.err.println("创建服务器失败: " + e.getMessage());
             e.printStackTrace();
@@ -74,15 +71,13 @@ public class ReliableUDPServer {
                 // 打印接收到的数据包
                 //System.out.println("收到数据包: " + receivedPacket);
 
-                // 如果是SYN包，创建新的连接
-                if (receivedPacket.isSYN() && (tcpStateMachine == null || tcpStateMachine.getState() == TCPStateMachine.State.LISTEN)) {
-                    handleNewClient(packet.getAddress(), packet.getPort());
+                // 处理新的客户端连接
+                if (receivedPacket.isSYN()) {
+                    handleNewClient(packet.getAddress(), packet.getPort(), receivedPacket);
                 }
 
-                // 处理数据包
-                if (tcpStateMachine != null) {
-                    tcpStateMachine.handlePacket(receivedPacket);
-                }
+                TCPStateMachine tcpStateMachine = clientStates.get(getClientKey(packet.getAddress(), packet.getPort()));
+                tcpStateMachine.handlePacket(receivedPacket);
 
                 // 重置缓冲区
                 packet.setLength(buffer.length);
@@ -94,33 +89,37 @@ public class ReliableUDPServer {
     }
 
     /**
-     * 处理新客户端连接
+     * 处理新的客户端连接
      */
-    private void handleNewClient(InetAddress clientAddress, int clientPort) {
+    private void handleNewClient(InetAddress clientAddress, int clientPort, Packet synPacket) {
         try {
-            System.out.println("新客户端连接: " + clientAddress + ":" + clientPort);
-
-            // 创建新的TCP状态机（服务器模式）
-            TCPStateMachine newStateMachine = new TCPStateMachine(
+            // 创建新的TCP状态机
+            TCPStateMachine tcpStateMachine = new TCPStateMachine(
                 socket,
                 clientAddress,
                 clientPort,
-                this::handleData,  // 数据处理回调
-                true              // 服务器模式
+                socket.getLocalPort()
             );
+            // 设置状态为LISTEN
+            tcpStateMachine.setState(State.LISTEN);
+            // 保存状态机
+            clientStates.put(getClientKey(clientAddress, clientPort), tcpStateMachine);
 
-            // 替换旧的状态机
-            if (tcpStateMachine != null) {
-                // TODO: 可能需要优雅地关闭旧连接
-            }
-            tcpStateMachine = newStateMachine;
-            clients.put(getClientKey(clientAddress, clientPort), newStateMachine);
         } catch (Exception e) {
-            System.err.println("创建TCP状态机失败: " + e.getMessage());
-            e.printStackTrace();
-            // 重置客户端信息
-            clientAddress = null;
-            clientPort = 0;
+            System.err.println("处理新客户端连接失败: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 发送数据到指定客户端
+     */
+    public void sendToClient(InetAddress clientAddress, int clientPort, byte[] data) throws IOException {
+        String clientKey = getClientKey(clientAddress, clientPort);
+        TCPStateMachine tcpStateMachine = clientStates.get(clientKey);
+        if (tcpStateMachine != null) {
+            tcpStateMachine.send(data, true);  // 设置PUSH标志
+        } else {
+            throw new IOException("Client not connected");
         }
     }
 
@@ -128,23 +127,6 @@ public class ReliableUDPServer {
         return clientAddress.getHostAddress() + ":" + clientPort;
     }
 
-    /**
-     * 处理接收到的数据
-     */
-    private void handleData(byte[] data) {
-        // 这里可以添加数据处理逻辑
-        System.out.println("收到数据: " + new String(data));
-
-        try {
-            // 回显数据
-            if (tcpStateMachine != null) {
-                tcpStateMachine.send(data);
-            }
-        } catch (Exception e) {
-            System.err.println("发送响应失败: " + e.getMessage());
-            e.printStackTrace();
-        }
-    }
 
     public static void main(String[] args) {
         ReliableUDPServer server = null;

@@ -19,10 +19,10 @@ public class Packet implements Serializable {
     public static final int TYPE_WINDOW_UPDATE = 6;  // 窗口更新类型
 
     // 控制位标志定义（使用低4位）
-    public static final int FLAG_ACK = 0x08;  // 确认应答号有效，除SYN包外必须为1
-    public static final int FLAG_PSH = 0x04;  // 接收方应尽快将这个报文段交给应用层
+    public static final int FLAG_ACK = 0x01;  // 确认应答号有效，除SYN包外必须为1
+    public static final int FLAG_PSH = 0x08;  // 接收方应尽快将这个报文段交给应用层
     public static final int FLAG_SYN = 0x02;  // 连接建立请求，用于初始化序列号
-    public static final int FLAG_FIN = 0x01;  // 断开连接请求，表示发送方已发送完所有数据
+    public static final int FLAG_FIN = 0x04;  // 断开连接请求，表示发送方已发送完所有数据
 
     private static final int HEADER_SIZE = 24;  // 实际的头部大小（字节）
     private static final int HEADER_LENGTH = 8;  // 头部长度字段的值（4位）
@@ -32,11 +32,8 @@ public class Packet implements Serializable {
     private final int destPort;        // 目标端口号 (16位)
     private final int seqNum;          // 序列号 (32位)：随机初始值，每次发送数据时加上数据字节数
     private final int ackNum;          // 确认应答号 (32位)：期望收到的下一个序列号，表示此序列号之前的数据都已正确接收
-    private final int headerLength;    // 首部长度 (4位)
     private final int flags;           // 控制位 (URG, ACK, PSH, RST, SYN, FIN)
     private final int windowSize;      // 接收窗口大小 (16位)：用于流量控制
-    private final int checksum;        // 校验和 (16位)
-    private final int urgentPointer;   // 紧急指针 (16位)
     private final byte[] data;         // 数据内容
     private final boolean last;        // 是否为最后一个包
     private final int rcvWnd;          // 接收窗口大小
@@ -61,94 +58,73 @@ public class Packet implements Serializable {
         this.destPort = destPort;
         this.seqNum = seqNum;
         this.ackNum = ackNum;
-        this.headerLength = HEADER_LENGTH;  // 使用4位表示的头部长度
         this.flags = flags;
         this.windowSize = windowSize;
-        this.checksum = 0;  // 暂时不计算校验和
-        this.urgentPointer = 0;
         this.data = data;
         this.last = last;
         this.rcvWnd = rcvWnd;
     }
 
     /**
-     * 创建一个SYN包（连接建立请求）
-     * @param sourcePort 源端口
-     * @param destPort 目标端口
-     * @param initialSeqNum 初始序列号（随机生成）
-     * @param windowSize 接收窗口大小
+     * 创建一个ACK包
      */
-    public static Packet createSYN(int sourcePort, int destPort, int initialSeqNum, int windowSize) {
-        return new Packet(TYPE_SYN, sourcePort, destPort, initialSeqNum, 0, FLAG_SYN, windowSize, null, false, windowSize);
+    public static Packet createAck(int sourcePort, int destPort, int seqNum, int ackNum, int windowSize) {
+        return new Packet(TYPE_ACK, sourcePort, destPort, seqNum, ackNum, FLAG_ACK, windowSize, null, false, 0);
     }
 
     /**
-     * 创建一个SYN-ACK包（连接建立响应）
-     * @param sourcePort 源端口
-     * @param destPort 目标端口
-     * @param initialSeqNum 初始序列号（随机生成）
-     * @param ackNum 确认应答号（收到的序列号+1）
-     * @param windowSize 接收窗口大小
+     * 创建一个SYN包
      */
-    public static Packet createSYNACK(int sourcePort, int destPort, int initialSeqNum, int ackNum, int windowSize) {
-        return new Packet(TYPE_SYN_ACK, sourcePort, destPort, initialSeqNum, ackNum, FLAG_SYN | FLAG_ACK, windowSize, null, false, windowSize);
+    public static Packet createSyn(int sourcePort, int destPort, int seqNum, int windowSize) {
+        return new Packet(TYPE_SYN, sourcePort, destPort, seqNum, 0, FLAG_SYN, windowSize, null, false, 0);
     }
 
     /**
-     * 创建一个数据包
-     * @param sourcePort 源端口
-     * @param destPort 目标端口
-     * @param seqNum 序列号
-     * @param ackNum 确认应答号
-     * @param data 数据内容
-     * @param windowSize 接收窗口大小
-     * @param rcvWnd 接收窗口大小
+     * 创建一个FIN包
      */
-    public static Packet createData(int sourcePort, int destPort, int seqNum, int ackNum, byte[] data, int windowSize, int rcvWnd) {
-        return new Packet(TYPE_DATA, sourcePort, destPort, seqNum, ackNum, FLAG_ACK, windowSize, data, false, rcvWnd);
-    }
-
-    /**
-     * 创建一个FIN包（连接断开请求）
-     * @param sourcePort 源端口
-     * @param destPort 目标端口
-     * @param seqNum 序列号
-     * @param ackNum 确认应答号
-     * @param windowSize 接收窗口大小
-     */
-    public static Packet createFIN(int sourcePort, int destPort, int seqNum, int ackNum, int windowSize) {
+    public static Packet createFin(int sourcePort, int destPort, int seqNum, int ackNum, int windowSize) {
         return new Packet(TYPE_FIN, sourcePort, destPort, seqNum, ackNum, FLAG_FIN | FLAG_ACK, windowSize, null, false, 0);
     }
 
     /**
-     * 创建一个ACK包（确认包）
-     * @param sourcePort 源端口
-     * @param destPort 目标端口
-     * @param seqNum 序列号
-     * @param ackNum 确认应答号
-     * @param windowSize 接收窗口大小
+     * 创建一个SYN-ACK包
      */
-    public static Packet createACK(int sourcePort, int destPort, int seqNum, int ackNum, int windowSize) {
-        return new Packet(TYPE_ACK, sourcePort, destPort, seqNum, ackNum, FLAG_ACK, windowSize, null, false, 0);
+    public static Packet createSynAck(int sourcePort, int destPort, int seqNum, int ackNum, int windowSize) {
+        return new Packet(TYPE_SYN_ACK, sourcePort, destPort, seqNum, ackNum, FLAG_SYN | FLAG_ACK, windowSize, null, false, 0);
     }
 
-    // 辅助方法：检查控制位
+    /**
+     * 创建一个数据包
+     */
+    public static Packet createData(int sourcePort, int destPort, int seqNum, int ackNum, byte[] data, int windowSize, boolean push) {
+        int flags = FLAG_ACK;
+        if (push) {
+            flags |= FLAG_PSH;
+        }
+        return new Packet(TYPE_DATA, sourcePort, destPort, seqNum, ackNum, flags, windowSize, data, false, 0);
+    }
+
+    /**
+     * 辅助方法：检查控制位
+     */
     public boolean isSYN() { return (flags & FLAG_SYN) != 0; }
     public boolean isACK() { return (flags & FLAG_ACK) != 0; }
     public boolean isFIN() { return (flags & FLAG_FIN) != 0; }
     public boolean isRST() { return false; }
+    public boolean isPSH() { return (flags & FLAG_PSH) != 0; }
     
-    // Getter 方法
+    // Getters
     public int getType() { return type; }
-    public int getSeqNum() { return seqNum; }
-    public int getAckNum() { return ackNum; }
-    public byte[] getData() { return data; }
     public int getSourcePort() { return sourcePort; }
     public int getDestPort() { return destPort; }
+    public int getSeqNum() { return seqNum; }
+    public int getAckNum() { return ackNum; }
+    public int getFlags() { return flags; }
     public int getWindowSize() { return windowSize; }
-    public boolean isLast() { return last; }
+    public byte[] getData() { return data; }
+    public boolean isLast() { return last; }  
     public int getRcvWnd() { return rcvWnd; }
-    
+
     /**
      * 获取数据长度，用于计算下一个序列号
      * 对于SYN和FIN包，虽然没有数据，但也要占用一个序列号
@@ -184,12 +160,12 @@ public class Packet implements Serializable {
         buffer.putInt(ackNum);                  // 确认应答号 (4 bytes)
         
         // 首部长度和标志位打包成一个字节
-        byte headerAndFlags = (byte)((headerLength << 4) | flags);
+        byte headerAndFlags = (byte)((HEADER_LENGTH << 4) | flags);
         buffer.put(headerAndFlags);             // 首部长度和标志位 (1 byte)
         
         buffer.putShort((short)windowSize);     // 窗口大小 (2 bytes)
-        buffer.putShort((short)checksum);       // 校验和 (2 bytes)
-        buffer.putShort((short)urgentPointer);  // 紧急指针 (2 bytes)
+        buffer.putShort((short)0);              // 校验和 (2 bytes)
+        buffer.putShort((short)0);              // 紧急指针 (2 bytes)
         buffer.put((byte)type);                 // 类型 (1 byte)
         buffer.put((byte)(last ? 1 : 0));       // 是否为最后一个包 (1 byte)
         
@@ -201,7 +177,7 @@ public class Packet implements Serializable {
         System.out.println("Created packet: type=" + type + ", flags=" + flags + 
                          ", seqNum=" + seqNum + ", ackNum=" + ackNum +
                          ", sourcePort=" + sourcePort + ", destPort=" + destPort +
-                         ", headerLength=" + headerLength + ", windowSize=" + windowSize +
+                         ", headerLength=" + HEADER_LENGTH + ", windowSize=" + windowSize +
                          ", dataLength=" + (data != null ? data.length : 0));  // 只显示实际数据长度
         
         return buffer.array();
@@ -268,8 +244,6 @@ public class Packet implements Serializable {
     }
 
     // Getters
-    public int getHeaderLength() { return headerLength; }
-    public int getFlags() { return flags; }
-    public int getChecksum() { return checksum; }
-    public int getUrgentPointer() { return urgentPointer; }
+    public int getChecksum() { return 0; }
+    public int getUrgentPointer() { return 0; }
 }
