@@ -12,72 +12,275 @@ import static com.reliableudp.Packet.TYPE_DATA;
 
 public class TCPSendBuffer {
     // TCP协议参数
-    private static final int MSS = 1460;           // Maximum Segment Size
-    private static final int INITIAL_BUFFER_SIZE = 65535; // 初始缓冲区大小
-    private static final int MAX_BUFFER_SIZE = 1024 * 1024; // 最大缓冲区大小
-    private static final int INITIAL_WINDOW = 1024;   // 初始窗口大小
-    private static final long DELAYED_ACK_TIMEOUT = 200; // 延迟发送超时时间(ms)
-    private static final int MIN_PACKET_SIZE = 512;   // Nagle算法的最小包大小
-
-    // TCP拥塞控制相关常量
-    private static final int INIT_CWND = MSS;  // 初始拥塞窗口为1个MSS
-    private static final int INIT_SSTHRESH = 65535;  // 初始慢启动阈值
-    private static final double BETA = 0.5;    // 快恢复时cwnd减少因子
+    private static final int MSS = 1024;  // Maximum Segment Size
+    private static final int INIT_CWND = MSS;
+    private static final int INIT_SSTHRESH = 65535;
+    private static final int BUFFER_SIZE = 65535;  // 发送缓冲区大小
+    private static final double BETA = 0.7;
     private static final int DUPACK_THRESHOLD = 3;  // 快重传阈值
 
-    // 发送窗口变量
-    private final int iss;          // Initial Send Sequence number
-    private int snd_una;           // 最早的未确认字节序号
-    private int snd_nxt;           // 下一个待发送字节序号
-    private int snd_wnd;           // 发送窗口大小
-    private int cwnd;              // 拥塞窗口大小
-    private int rwnd;              // 接收方通告窗口大小
+    private final byte[] sendBuffer;      // 发送缓冲区
+    private int snd_una;                  // 最老的未确认字节
+    private int snd_nxt;                  // 下一个要发送的字节
+    private int snd_wnd;                  // 发送窗口 = min(cwnd, rwnd)
+    private int cwnd;                     // 拥塞窗口
+    private int ssthresh;                 // 慢启动阈值
+    private int rwnd;                     // 接收窗口
+    private int dupAckCount;              // 重复ACK计数
+    private int lastAckedSeq;             // 最后确认的序号
+    private int bufferEnd;                // 缓冲区末尾位置
+
+    public void updateSndNxt(int seq) {
+        this.snd_nxt = seq;
+    }
+
+    public int getSndNxt() {
+        return snd_nxt;
+    }
+
+    public int getSndUna() {
+        return snd_una;
+    }
+
+    public int getSndWnd() {
+        return Math.min(cwnd, rwnd);
+    }
+
+    public void updateRwnd(int rwnd) {
+        this.rwnd = rwnd;
+        this.snd_wnd = getSndWnd();
+    }
+
+    public boolean allDataAcked() {
+        return snd_una >= snd_nxt;
+    }
+
+    private enum CongestionState {
+        SLOW_START,           // 慢启动
+        CONGESTION_AVOIDANCE, // 拥塞避免
+        FAST_RECOVERY        // 快恢复
+    }
+    private CongestionState state;
+
+    private final ScheduledExecutorService scheduler;
+    private final Consumer<Boolean> packetSender;
+    private ScheduledFuture<?> delayedSendTask;
     
-    // 拥塞控制相关变量
-    private int ssthresh = INIT_SSTHRESH; // 慢启动阈值
-    private int dupAckCount = 0;          // 重复ACK计数
-    private int lastAckedSeq = -1;        // 上一个确认的序号
-    private CongestionState congestionState = CongestionState.SLOW_START;
+    public TCPSendBuffer(Consumer<Boolean> packetSender) {
+        this.sendBuffer = new byte[BUFFER_SIZE];
+        this.packetSender = packetSender;
+        this.scheduler = Executors.newSingleThreadScheduledExecutor();
+        this.snd_una = 0;
+        this.snd_nxt = 0;
+        this.cwnd = INIT_CWND;
+        this.ssthresh = INIT_SSTHRESH;
+        this.rwnd = 65535;
+        this.snd_wnd = getSndWnd();
+        this.state = CongestionState.SLOW_START;
+        this.dupAckCount = 0;
+        this.lastAckedSeq = -1;
+        this.bufferEnd = 0;
+    }
 
-    // 缓冲区管理
-    private static class Segment {
-        final byte[] data;
-        final int offset;
-        final int length;
-        final long timestamp;
-        final boolean force;  // 添加force标志
-        Segment next;
+    public synchronized boolean writeToBuffer(byte[] data, boolean force) {
+        if (data == null || data.length == 0) {
+            return false;
+        }
 
-        Segment(byte[] data, int offset, int length, boolean force) {
-            this.data = Arrays.copyOf(data, length);
-            this.offset = offset;
-            this.length = length;
-            this.timestamp = System.currentTimeMillis();
-            this.force = force;
+        // 检查缓冲区空间
+        if (snd_nxt - snd_una + data.length > BUFFER_SIZE) {
+            return false;
+        }
+
+        // 复制数据到缓冲区
+        int writePos = snd_nxt % BUFFER_SIZE;
+        int firstPart = Math.min(data.length, BUFFER_SIZE - writePos);
+        System.arraycopy(data, 0, sendBuffer, writePos, firstPart);
+        
+        if (firstPart < data.length) {
+            // 需要环绕写入
+            System.arraycopy(data, firstPart, sendBuffer, 0, data.length - firstPart);
+        }
+
+        // 更新缓冲区末尾位置
+        bufferEnd = Math.max(bufferEnd, snd_nxt + data.length);
+
+        // Nagle算法：
+        // 1. 如果数据大于等于MSS，立即发送
+        // 2. 如果是强制发送（比如FIN包），立即发送
+        // 3. 如果没有未确认数据，并且累积数据达到阈值，立即发送
+        // 4. 否则，延迟发送等待更多数据
+        int accumulatedSize = bufferEnd - snd_nxt;
+        if (data.length >= MSS || force || 
+            (snd_una == snd_nxt && accumulatedSize >= MSS/2)) {
+            packetSender.accept(force);
+        } else {
+            scheduleDelayedSend();
+        }
+
+        return true;
+    }
+
+    public synchronized SendData getNextData() {
+        // 检查发送窗口
+        int availableWindow = snd_wnd - (snd_nxt - snd_una);
+        if (availableWindow <= 0) {
+            return null;
+        }
+
+        // 检查实际可用数据量
+        int availableData = Math.max(0, bufferEnd - snd_nxt);
+        if (availableData == 0) {
+            return null;
+        }
+
+        // 限制发送大小
+        availableWindow = Math.min(availableWindow, MSS);
+        availableWindow = Math.min(availableWindow, availableData);
+
+        // 准备发送数据
+        byte[] dataToSend = new byte[availableWindow];
+        int readPos = snd_nxt % BUFFER_SIZE;
+        int firstPart = Math.min(availableWindow, BUFFER_SIZE - readPos);
+        System.arraycopy(sendBuffer, readPos, dataToSend, 0, firstPart);
+        
+        if (firstPart < availableWindow) {
+            // 需要环绕读取
+            System.arraycopy(sendBuffer, 0, dataToSend, firstPart, availableWindow - firstPart);
+        }
+
+        int seqNum = snd_nxt;
+        snd_nxt += availableWindow;
+
+        return new SendData(seqNum, dataToSend, false, availableWindow);
+    }
+
+    public synchronized void handleAck(int ackNum) {
+        if (ackNum >= snd_una) {
+            // 更新已确认数据位置
+            snd_una = ackNum;
+
+            // 处理拥塞控制
+            boolean isNewAck = ackNum > lastAckedSeq;
+            if (isNewAck) {
+                handleNewAck(ackNum);
+            } else {
+                handleDupAck();
+            }
+            lastAckedSeq = ackNum;
         }
     }
 
-    private Segment head;  // 发送缓冲区头部
-    private Segment tail;  // 发送缓冲区尾部
-    private long totalBufferedSize; // 总缓冲数据大小
-    
-    // 已发送但未确认的包
-    private final Map<Integer, SendData> unackedPackets;
-    private final ScheduledExecutorService scheduler;
-    private ScheduledFuture<?> delayedSendTask;
-    private ScheduledFuture<?> persistTimer;
-    
-    // Nagle算法相关
-    private boolean nagleEnabled = true;
-    private Segment lastSegment;  // 最后一个未发送的段
+    private void scheduleDelayedSend() {
+        if (delayedSendTask != null && !delayedSendTask.isDone()) {
+            return;
+        }
+        delayedSendTask = scheduler.schedule(() -> {
+            synchronized (TCPSendBuffer.this) {
+                packetSender.accept(false);
+            }
+        }, 100, TimeUnit.MILLISECONDS);
+    }
 
-    private final Consumer<Boolean> packetSender;  // 实际发送数据的回调函数，带重传标志
+    public synchronized void updateSndUna(int ack) {
+        if (ack > snd_una) {
+            snd_una = ack;
+        }
+    }
 
-    // 拥塞控制状态
-    private enum CongestionState {
-        SLOW_START,      // 慢启动
-        CONGESTION_AVOIDANCE,  // 拥塞避免
-        FAST_RECOVERY    // 快恢复
+    public synchronized void updateReceiveWindow(int windowSize) {
+        this.rwnd = windowSize;
+    }
+
+    public synchronized int getSnd_wnd() {
+        return Math.min(cwnd, rwnd) - (snd_nxt - snd_una);
+    }
+
+    public void close() {
+        if (delayedSendTask != null) {
+            delayedSendTask.cancel(false);
+        }
+        scheduler.shutdown();
+        try {
+            scheduler.awaitTermination(1, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    public synchronized void handleTimeout() {
+        // 超时重传
+        ssthresh = Math.max((int)(cwnd * BETA), 2 * MSS);
+        cwnd = INIT_CWND;
+        state = CongestionState.SLOW_START;
+        dupAckCount = 0;
+        
+        // 重传数据
+        retransmitLostPacket();
+        
+        System.out.println("超时重传：cwnd=" + cwnd + ", ssthresh=" + ssthresh);
+    }
+
+    private void handleNewAck(int ackNum) {
+        snd_una = ackNum;
+        dupAckCount = 0;
+
+        switch (state) {
+            case SLOW_START:
+                // 慢启动：指数增长
+                cwnd += MSS;
+                if (cwnd >= ssthresh) {
+                    state = CongestionState.CONGESTION_AVOIDANCE;
+                    System.out.println("进入拥塞避免：cwnd=" + cwnd + ", ssthresh=" + ssthresh);
+                }
+                break;
+
+            case CONGESTION_AVOIDANCE:
+                // 拥塞避免：线性增长，每个RTT增加一个MSS
+                cwnd += MSS * MSS / cwnd;
+                break;
+
+            case FAST_RECOVERY:
+                // 退出快恢复
+                cwnd = ssthresh;
+                state = CongestionState.CONGESTION_AVOIDANCE;
+                System.out.println("退出快恢复：cwnd=" + cwnd);
+                break;
+        }
+        // 更新发送窗口
+        snd_wnd = getSndWnd();
+    }
+
+    private void handleDupAck() {
+        dupAckCount++;
+        if (dupAckCount == DUPACK_THRESHOLD) {
+            // 进入快恢复
+            ssthresh = Math.max((int)(cwnd * BETA), 2 * MSS);
+            cwnd = ssthresh + 3 * MSS;  // 快恢复初始窗口
+            state = CongestionState.FAST_RECOVERY;
+            
+            // 快重传
+            retransmitLostPacket();
+            
+            System.out.println("进入快恢复：cwnd=" + cwnd + ", ssthresh=" + ssthresh);
+        } else if (state == CongestionState.FAST_RECOVERY) {
+            // 快恢复期间收到重复ACK
+            cwnd += MSS;
+        }
+    }
+
+    private void retransmitLostPacket() {
+        // 重传snd_una处的数据包
+        byte[] data = findDataToRetransmit();
+        if (data != null) {
+            packetSender.accept(true);  // force=true表示需要立即重传
+        }
+    }
+
+    private byte[] findDataToRetransmit() {
+        // 在实际实现中，需要维护未确认数据的副本
+        // 这里简化处理，返回null
+        return null;
     }
 
     // 发送数据的包装类
@@ -85,11 +288,13 @@ public class TCPSendBuffer {
         private final int seqNum;
         private final byte[] data;
         private final boolean force;
+        private final int length;  // 实际数据长度
 
-        public SendData(int seqNum, byte[] data, boolean force) {
+        public SendData(int seqNum, byte[] data, boolean force, int length) {
             this.seqNum = seqNum;
             this.data = data;
             this.force = force;
+            this.length = length;
         }
 
         public int getSeqNum() {
@@ -103,429 +308,17 @@ public class TCPSendBuffer {
         public boolean isForce() {
             return force;
         }
-    }
 
-    public TCPSendBuffer(Consumer<Boolean> packetSender) {
-        // 初始化序列号
-        this.iss = getInitialSequenceNumber();
-        this.snd_una = this.iss;
-        this.snd_nxt = this.iss;
-        
-        // 初始化窗口
-        this.snd_wnd = INITIAL_WINDOW;
-        this.cwnd = INIT_CWND;
-        this.rwnd = INITIAL_WINDOW;
-
-        
-        this.unackedPackets = new ConcurrentHashMap<>();
-        this.scheduler = Executors.newScheduledThreadPool(2);
-        this.totalBufferedSize = 0;
-        this.packetSender = packetSender;
-        
-        setupTimers();
-    }
-
-    private void setupTimers() {
-        // 持久化定时器，用于处理零窗口探测
-        persistTimer = scheduler.scheduleWithFixedDelay(
-            this::checkWindowProbe,
-            1000, 1000, TimeUnit.MILLISECONDS
-        );
-
-        // 设置发送进程，定期检查并发送数据
-        scheduler.scheduleWithFixedDelay(
-            this::processTransmitQueue,
-            100,  // 初始延迟100ms
-            100,  // 每100ms检查一次发送队列
-            TimeUnit.MILLISECONDS
-        );
-    }
-
-    private void processTransmitQueue() {
-        synchronized(this) {
-            if (!canSendData()) {
-                return;
-            }
-
-            // 获取下一个要发送的数据
-            SendData nextData = getNextData();
-            if (nextData != null) {
-                packetSender.accept(nextData.isForce());
-            }
+        public int getLength() {
+            return length;
         }
     }
-
-    private void scheduleDelayedSend() {
-        if (delayedSendTask != null) {
-            delayedSendTask.cancel(false);
-        }
-        delayedSendTask = scheduler.schedule(
-            this::flushBufferedData,
-            DELAYED_ACK_TIMEOUT,
-            TimeUnit.MILLISECONDS
-        );
-    }
-
-    public int getSnd_wnd() {
-        return snd_wnd;
-    }
-
-    private void flushBufferedData() {
-        synchronized(this) {
-            // 先发送最后一个可能合并的小包段
-            if (lastSegment != null) {
-                writeToBuffer(lastSegment.data, true);
-                lastSegment = null;
-            }
-            
-            // 发送其他缓存的段
-            while (head != null && canSendData()) {
-                Segment current = head;
-                head = current.next;
-                if (head == null) {
-                    tail = null;
-                }
-                
-                writeToBuffer(current.data, true);
-                totalBufferedSize -= current.length;
-            }
-        }
-    }
-
-    private void checkWindowProbe() {
-        if (getEffectiveWindow() == 0 && !unackedPackets.isEmpty()) {
-            // 发送窗口探测包
-            probeWindow();
-        }
-    }
-
-    private void probeWindow() {
-        // 发送1字节的探测包
-        if (!unackedPackets.isEmpty()) {
-            Map.Entry<Integer, SendData> firstUnacked = 
-                unackedPackets.entrySet().iterator().next();
-            byte[] probeData = new byte[1];
-            probeData[0] = firstUnacked.getValue().getData()[0];
-            writeToBuffer(probeData, true); // 强制发送探测包
-        }
-    }
-
-    /**
-     * 应用层调用，尝试立即发送数据
-     */
-    public synchronized SendData getNextData() {
-        if (lastSegment != null) {
-            Segment segment = lastSegment;
-            lastSegment = null;
-            int seqNum = snd_nxt;
-            snd_nxt += segment.length;
-            return new SendData(seqNum, segment.data, segment.force);
-        }
-
-        // 检查缓冲区中的数据
-        if (head != null) {
-            Segment current = head;
-            head = head.next;
-            if (head == null) {
-                tail = null;
-            }
-            
-            totalBufferedSize -= current.length;
-            int seqNum = snd_nxt;
-            snd_nxt += current.length;
-            return new SendData(seqNum, current.data, current.force);
-        }
-
-        return null;
-    }
-
-    /**
-     * 应用层调用，将数据放入发送缓冲区
-     * @param data 要发送的数据
-     * @param push 是否设置PUSH标志
-     */
-    public synchronized boolean put(byte[] data, boolean push) {
-        if (data == null || data.length == 0) {
-            return false;
-        }
-
-        // 检查内存压力
-        if (!checkMemoryPressure(data.length)) {
-            return false;
-        }
-
-        // 如果设置了PUSH标志，立即发送所有缓冲数据
-        if (push) {
-            // 先发送已缓存的数据
-            flushBufferedData();
-            // 然后发送当前数据
-            return writeToBuffer(data, true);
-        }
-
-        // 否则应用Nagle算法
-        if (nagleEnabled && data.length < MIN_PACKET_SIZE) {
-            return tryMergeSegment(data);
-        }
-
-        return bufferSegment(data, false);
-    }
-
-    /**
-     * 默认的put方法，不设置PUSH标志
-     */
-    public boolean put(byte[] data) {
-        return put(data, false);
-    }
-
-    private boolean tryMergeSegment(byte[] data) {
-        if (lastSegment == null) {
-            lastSegment = new Segment(data, 0, data.length, false);
-            totalBufferedSize += data.length;
-            scheduleDelayedSend();
-            return true;
-        }
-        
-        if (lastSegment.length + data.length > MSS) {
-            // 当前lastSegment已经不能再合并了，将其加入发送队列
-            bufferSegment(lastSegment.data, lastSegment.force);
-            lastSegment = new Segment(data, 0, data.length, false);
-            totalBufferedSize += data.length;
-            scheduleDelayedSend();
-            return true;
-        }
-        
-        // 合并数据
-        byte[] newData = new byte[lastSegment.length + data.length];
-        System.arraycopy(lastSegment.data, 0, newData, 0, lastSegment.length);
-        System.arraycopy(data, 0, newData, lastSegment.length, data.length);
-        
-        // 更新最后一个段
-        lastSegment = new Segment(newData, 0, newData.length, lastSegment.force);
-        totalBufferedSize += data.length;
-        
-        // 如果没有设置定时器，设置一个
-        scheduleDelayedSend();
-        return true;
-    }
-
-    private boolean bufferSegment(byte[] data, boolean force) {
-        if (checkMemoryPressure(data.length)) {
-            return false;
-        }
-
-        Segment segment = new Segment(data, 0, data.length, force);
-        if (head == null) {
-            head = segment;
-        } else {
-            tail.next = segment;
-        }
-        tail = segment;
-        totalBufferedSize += data.length;
-        return true;
-    }
-
-    private boolean writeToBuffer(byte[] data, boolean force) {
-        synchronized(this) {
-            if (!force && !canSendData()) {
-                return bufferSegment(data, force);
-            }
-
-            Segment segment = new Segment(data, 0, data.length, force);
-
-            // 加入发送队列
-            if (head == null) {
-                head = segment;
-            } else {
-                tail.next = segment;
-            }
-            tail = segment;
-            totalBufferedSize += data.length;
-
-            // 如果是force发送，立即触发回调
-            if (force) {
-                packetSender.accept(true);
-            }
-
-            return true;
-        }
-    }
-
-    public synchronized void handleAck(int ackNum) {
-        if (ackNum >= snd_una && ackNum <= snd_nxt) {
-            boolean isNewAck = ackNum > lastAckedSeq;
-            
-            // 更新拥塞窗口
-            updateCongestionWindow(isNewAck);
-            
-            if (isNewAck) {
-                // 更新最早未确认序号
-                snd_una = ackNum;
-                lastAckedSeq = ackNum;
-                
-                // 清理已确认的包
-                Iterator<Map.Entry<Integer, SendData>> it = 
-                    unackedPackets.entrySet().iterator();
-                while (it.hasNext()) {
-                    if (it.next().getKey() <= ackNum) {
-                        it.remove();
-                    }
-                }
-                
-                // 尝试发送更多数据
-                flushBufferedData();
-            }
-        }
-    }
-
-    private void enterSlowStart() {
-        cwnd = INIT_CWND;
-        ssthresh = INIT_SSTHRESH;
-        congestionState = CongestionState.SLOW_START;
-        System.out.println("进入慢启动: cwnd=" + cwnd + ", ssthresh=" + ssthresh);
-    }
-
-    private void enterCongestionAvoidance() {
-        congestionState = CongestionState.CONGESTION_AVOIDANCE;
-        System.out.println("进入拥塞避免: cwnd=" + cwnd + ", ssthresh=" + ssthresh);
-    }
-
-    private void enterFastRecovery() {
-        ssthresh = Math.max((int)(cwnd * BETA), 2 * MSS);
-        cwnd = ssthresh + 3 * MSS;  // 快恢复初始窗口
-        congestionState = CongestionState.FAST_RECOVERY;
-        System.out.println("进入快恢复: cwnd=" + cwnd + ", ssthresh=" + ssthresh);
-    }
-
-    private void handleTimeout() {
-        ssthresh = Math.max((int)(cwnd * BETA), 2 * MSS);
-        cwnd = INIT_CWND;
-        dupAckCount = 0;
-        congestionState = CongestionState.SLOW_START;
-        System.out.println("超时: cwnd=" + cwnd + ", ssthresh=" + ssthresh);
-    }
-
-    private void updateCongestionWindow(boolean isNewAck) {
-        if (!isNewAck) {
-            // 重复ACK
-            dupAckCount++;
-            if (dupAckCount == DUPACK_THRESHOLD) {
-                // 进入快恢复
-                enterFastRecovery();
-            } else if (congestionState == CongestionState.FAST_RECOVERY) {
-                // 快恢复期间收到重复ACK
-                cwnd += MSS;
-            }
-            return;
-        }
-
-        // 新ACK
-        dupAckCount = 0;
-
-        switch (congestionState) {
-            case SLOW_START:
-                cwnd += MSS;  // 指数增长
-                if (cwnd >= ssthresh) {
-                    enterCongestionAvoidance();
-                }
-                break;
-
-            case CONGESTION_AVOIDANCE:
-                // 加性增，每个RTT增加一个MSS
-                cwnd += MSS * MSS / cwnd;
-                break;
-
-            case FAST_RECOVERY:
-                // 退出快恢复
-                cwnd = ssthresh;
-                congestionState = CongestionState.CONGESTION_AVOIDANCE;
-                System.out.println("退出快恢复: cwnd=" + cwnd);
-                break;
-        }
-    }
-
-
-    private int getEffectiveWindow() {
-        // 使用拥塞窗口和接收窗口的最小值
-        return Math.min(cwnd, rwnd) - (snd_nxt - snd_una);
-    }
-
-    public void setNagleAlgorithm(boolean enabled) {
-        this.nagleEnabled = enabled;
-        if (!enabled) {
-            flushBufferedData();
-        }
-    }
-
-    public void close() {
-        if (persistTimer != null) {
-            persistTimer.cancel(false);
-        }
-        if (delayedSendTask != null) {
-            delayedSendTask.cancel(false);
-        }
-        scheduler.shutdown();
-        try {
-            scheduler.awaitTermination(1, TimeUnit.SECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-    }
-
-    public synchronized void updateReceiveWindow(int windowSize) {
-        this.rwnd = windowSize;
-        // 窗口更新后，尝试发送被阻塞的数据
-        flushBufferedData();
-    }
-
-    private boolean canSendData() {
-        if (unackedPackets.isEmpty()) {
-            return true;
-        }
-        
-        int effectiveWindow = getEffectiveWindow();
-        return effectiveWindow > 0;
-    }
-
-    private int getInitialSequenceNumber() {
-        return new Random().nextInt(Integer.MAX_VALUE);
-    }
-
-    private boolean checkMemoryPressure(int additionalSize) {
-        return totalBufferedSize + additionalSize <= MAX_BUFFER_SIZE;
-    }
-
-    public int getSndNxt() {
-        return snd_nxt;
-    }
-
-    public int getSndUna() {
-        return snd_una;
-    }
-
-    public void updateSndNxt(int newSndNxt) {
-        this.snd_nxt = newSndNxt;
-    }
-
-    public boolean allDataAcked() {
-        return unackedPackets.isEmpty();
-    }
-
-    public void clear() {
-        unackedPackets.clear();
-        head = tail = lastSegment = null;
-        totalBufferedSize = 0;
-    }
-
-
     @Override
     public String toString() {
         return String.format(
-            "SendBuffer[ISS=%d, SND.UNA=%d, SND.NXT=%d, SND.WND=%d, " +
-            "CWND=%d, RWND=%d, UnackedPackets=%d, BufferedSize=%d, " +
-            "NagleEnabled=%s, CongestionState=%s]",
-            iss, snd_una, snd_nxt, snd_wnd, cwnd, rwnd,
-            unackedPackets.size(), totalBufferedSize, nagleEnabled,
-            congestionState
+            "SendBuffer[SND.UNA=%d, SND.NXT=%d, SND.WND=%d, " +
+            "CWND=%d, RWND=%d, State=%s]",
+            snd_una, snd_nxt, snd_wnd, cwnd, rwnd, state
         );
     }
 }

@@ -161,7 +161,7 @@ public class TCPStateMachine {
         if (state != State.ESTABLISHED) {
             throw new IOException("Connection not established");
         }
-        sendBuffer.put(data, push);
+        sendBuffer.writeToBuffer(data, push);
     }
 
     /**
@@ -193,19 +193,6 @@ public class TCPStateMachine {
             );
             socket.send(datagramPacket);
 
-            // 如果是SYN或SYN-ACK包，sndNxt
-            if (packet.isSYN()) {
-                sendBuffer.updateSndNxt(packet.getSeqNum() + 1);  // SYN占用一个序号
-            }
-            // 如果是数据包，更新sndNxt
-            else if (packet.getData() != null && packet.getData().length > 0) {
-                sendBuffer.updateSndNxt(packet.getSeqNum() + packet.getData().length);
-            }
-            // 如果是FIN包，更新sndNxt
-            else if (packet.isFIN()) {
-                sendBuffer.updateSndNxt(packet.getSeqNum() + 1);  // FIN占用一个序号
-            }
-
             // 如果不是重传，则启动重传定时器
             if (!isRetransmission) {
                 startRetransmissionTimer(packet);
@@ -234,7 +221,8 @@ public class TCPStateMachine {
      */
     private void sendSyn() throws IOException {
         if (state == State.CLOSED) {
-            Packet synPacket = Packet.createSyn(localPort, peerPort, sendBuffer.getSndNxt(), receiveBuffer.getRcvWnd());
+            Packet synPacket = Packet.createSyn(localPort, peerPort, sendBuffer.getSndUna(), receiveBuffer.getRcvWnd());
+            sendBuffer.updateSndNxt(synPacket.getSeqNum() + 1);
             sendWithRetransmission(synPacket, false);
             state = State.SYN_SENT;
         }
@@ -248,7 +236,7 @@ public class TCPStateMachine {
                     localPort, 
                     peerPort, 
                     nextData.getSeqNum(), 
-                    receiveBuffer.getRcvWnd(),
+                    receiveBuffer.getRcvNxt(),
                     nextData.getData(),
                     sendBuffer.getSnd_wnd(), 
                     force || nextData.isForce()  // 使用force参数或SendData中的force标志
@@ -269,6 +257,7 @@ public class TCPStateMachine {
             receiveBuffer.getRcvNxt(),
             receiveBuffer.getRcvWnd()
         );
+        sendBuffer.updateSndNxt(fin.getSeqNum() + 1);
         sendWithRetransmission(fin, false);
         state = State.FIN_WAIT_1;
     }
@@ -284,6 +273,7 @@ public class TCPStateMachine {
             packet.getSeqNum() + 1,
             receiveBuffer.getRcvWnd()
         );
+        sendBuffer.updateSndNxt(synAck.getSeqNum() + 1);
         sendWithRetransmission(synAck, false);
     }
 
@@ -517,7 +507,6 @@ public class TCPStateMachine {
         }
 
         // 清理数据结构
-        sendBuffer.clear();
         sendTimes.clear();
     }
 
