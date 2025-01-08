@@ -53,6 +53,14 @@ public class ReliableUDPServer {
         serverSocket.close();
     }
 
+    public void close(TCPConnection connection) {
+        connection.getTcpStateMachine().disconnect(connection);
+    }
+
+    public TCPConnection accept() {
+        return connectionManager.accept();
+    }
+
     /**
      * 接收循环
      */
@@ -107,6 +115,15 @@ public class ReliableUDPServer {
                     System.arraycopy(packet.getData(), packet.getOffset(), data, 0, packet.getLength());
                     Packet tcpPacket = Packet.fromBytes(data);
                     connection.getTcpStateMachine().handlePacket(tcpPacket, connection);
+
+                    if (connection.state == State.CLOSED) {
+                        connectionManager.removeConnection(connectionKey);
+                    }
+
+                    //TODO 默认直接关闭
+                    if (connection.state == State.CLOSED_WAIT) {
+                        connection.getTcpStateMachine().disconnect((TCPConnection)connection);
+                    }
                 }
             } catch (IOException e) {
                 if (running) {

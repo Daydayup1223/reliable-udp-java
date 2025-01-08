@@ -28,6 +28,12 @@ public class TCPReceiveBuffer {
         this.baseSeqNum = seq;  //
     }
 
+    public void setRcvNxt(int rcvNxt) {
+        this.rcvNxt = rcvNxt;
+    }
+
+
+
     /**
      * 设置初始序号，在收到SYN时调用
      */

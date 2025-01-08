@@ -93,8 +93,18 @@ public class ReliableUDPClient {
      * 关闭连接
      */
     public void close() {
-        running = false;
-        connection.getSocket().close();
-        receiveThread.interrupt();
+        //四次挥手
+        if (connection.state == State.ESTABLISHED) {
+            connection.getTcpStateMachine().disconnect((TCPConnection)connection);
+        }
+
+        while (true) {
+            if (connection.state == State.CLOSED) {
+                running = false;
+                connection.getSocket().close();
+                receiveThread.interrupt();
+                break;
+            }
+        }
     }
 }

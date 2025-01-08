@@ -65,6 +65,7 @@ public class ClientMain {
                         sendReorderedMessages();
                         break;
                     case "4":
+                        client.close();
                         System.out.println("正在退出...");
                         return;
                     default:
