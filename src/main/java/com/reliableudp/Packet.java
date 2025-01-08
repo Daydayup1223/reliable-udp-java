@@ -6,6 +6,7 @@ import java.nio.ByteBuffer;
 /**
  * 数据包类，实现可靠UDP传输的基本单元
  */
+
 public class Packet implements Serializable {
     private static final long serialVersionUID = 1L;
 

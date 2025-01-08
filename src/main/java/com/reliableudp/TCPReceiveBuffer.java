@@ -18,14 +18,14 @@ public class TCPReceiveBuffer {
     private final Consumer<byte[]> dataConsumer; // 数据消费者
     private int baseSeqNum;               // 初始序号
 
-    public TCPReceiveBuffer(int capacity, Consumer<byte[]> consumer) {
+    public TCPReceiveBuffer(int capacity, Consumer<byte[]> consumer, int seq, int ack) {
         this.capacity = capacity;
         this.buffer = new byte[capacity];
         this.received = new boolean[capacity];
-        this.rcvNxt = 0;  // 初始为0，在收到SYN后通过setInitialSequenceNumber更新
+        this.rcvNxt = ack;  //
         this.rcvWnd = capacity;  // 接收窗口大小设置为缓冲区容量
         this.dataConsumer = consumer;
-        this.baseSeqNum = 0;  // 初始为0，在收到SYN后更新
+        this.baseSeqNum = seq;  //
     }
 
     /**

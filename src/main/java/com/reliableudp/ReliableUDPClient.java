@@ -2,70 +2,48 @@ package com.reliableudp;
 
 import java.io.IOException;
 import java.net.*;
-import java.util.concurrent.*;
-import java.util.Random;
+
+import com.reliableudp.TCPConnectionManager.BaseConnection;
+import com.reliableudp.TCPConnectionManager.RequestSock;
+import com.reliableudp.TCPConnectionManager.TCPConnection;
+import com.reliableudp.TCPStateMachine.State;
 
 public class ReliableUDPClient {
-    private static final int MAX_PACKET_SIZE = 1024;
-    private final DatagramSocket socket;
-    private final InetAddress serverAddress;
-    private final int serverPort;
-    private final TCPStateMachine tcpStateMachine;
-    private final Thread receiveThread;
+    private BaseConnection connection;
+    private Thread receiveThread;
     private volatile boolean running;
+    private final byte[] receiveBuffer = new byte[1024];
 
     public ReliableUDPClient(String host, int port) throws IOException {
-        // 创建UDP socket
-        this.socket = new DatagramSocket();
-        this.serverAddress = InetAddress.getByName(host);
-        this.serverPort = port;
-        
-        // 创建TCP状态机
-        this.tcpStateMachine = new TCPStateMachine(
-            socket,
-            serverAddress,
-            serverPort,
-            socket.getLocalPort()
+        connection = new RequestSock(
+            host,
+            port,
+            9276,
+            (int)System.currentTimeMillis() // 简单的序列号生成
         );
-
-        
-        // 创建接收线程
-        this.receiveThread = new Thread(this::receiveLoop);
-        this.running = true;
-        this.receiveThread.start();
-        
-        // 建立连接
-        connect();
+        connection.setSocket(new DatagramSocket(9276));
     }
 
     /**
      * 建立连接
      */
     public void connect() throws IOException {
-        // 发送SYN包
-        tcpStateMachine.connect();
-        
-        // 等待连接建立
-        long startTime = System.currentTimeMillis();
-        while (System.currentTimeMillis() - startTime < 5000) {  // 5秒超时
-            if (tcpStateMachine.isConnected()) {
-                return;
-            }
-            try {
-                Thread.sleep(100);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new IOException("Connection interrupted");
-            }
-        }
-        throw new IOException("Connection timeout");
+        connection.getTcpStateMachine().connect((RequestSock)connection);
+        this.receiveThread = new Thread(this::receiveLoop);
+        this.receiveThread.start();
+        // 创建接收线程
+        this.running = true;
     }
 
     /**
      * 发送数据
      */
     public void send(byte[] data, boolean push) throws IOException {
-        tcpStateMachine.send(data, push);
+        TCPConnection tcpConnection = (TCPConnection)connection;
+        if (tcpConnection.getState() != TCPStateMachine.State.ESTABLISHED) {
+            throw new IOException("连接未建立");
+        }
+        tcpConnection.getSendBuffer().writeToBuffer(data, push);
     }
 
     /**
@@ -83,47 +61,40 @@ public class ReliableUDPClient {
     }
 
     /**
-     * 关闭连接
-     */
-    public void disconnect() throws IOException {
-        if (tcpStateMachine != null) {
-            flush();  // 先刷新缓冲区
-            tcpStateMachine.close();
-            running = false;
-            receiveThread.interrupt();
-            socket.close();
-        }
-    }
-
-    /**
      * 接收循环
      */
     private void receiveLoop() {
-        byte[] buffer = new byte[MAX_PACKET_SIZE];
-        DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
-        
         while (running) {
             try {
-                socket.receive(packet);
-                byte[] data = java.util.Arrays.copyOf(packet.getData(), packet.getLength());
-                handlePacket(data);
+                DatagramPacket packet = new DatagramPacket(receiveBuffer, receiveBuffer.length);
+                connection.getSocket().receive(packet);
+                
+                // 处理接收到的数据
+                byte[] data = new byte[packet.getLength()];
+                System.arraycopy(packet.getData(), packet.getOffset(), data, 0, packet.getLength());
+                Packet tcpPacket = Packet.fromBytes(data);
+
+                // 交给TCP状态机处理
+                connection.getTcpStateMachine().handlePacket(tcpPacket, connection);
+
+                if (connection.state == State.ESTABLISHED) {
+                    RequestSock requestSock = (RequestSock)connection;
+                    connection = requestSock.promoteToFullConnection();
+                }
             } catch (IOException e) {
                 if (running) {
-                    System.err.println("接收错误: " + e.getMessage());
+                    System.err.println("接收数据失败: " + e.getMessage());
                 }
             }
         }
     }
 
     /**
-     * 处理收到的数据包
+     * 关闭连接
      */
-    private void handlePacket(byte[] data) {
-        try {
-            Packet packet = Packet.fromBytes(data);
-            tcpStateMachine.handlePacket(packet);
-        } catch (Exception e) {
-            System.err.println("处理数据包错误: " + e.getMessage());
-        }
+    public void close() {
+        running = false;
+        connection.getSocket().close();
+        receiveThread.interrupt();
     }
 }

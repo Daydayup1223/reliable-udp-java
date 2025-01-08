@@ -2,21 +2,27 @@ package com.reliableudp;
 
 import java.io.IOException;
 import java.net.*;
-import java.util.concurrent.*;
 
+import com.reliableudp.TCPConnectionManager.BaseConnection;
+import com.reliableudp.TCPConnectionManager.RequestSock;
+import com.reliableudp.TCPConnectionManager.TCPConnection;
 import com.reliableudp.TCPStateMachine.State;
 
 public class ReliableUDPServer {
-    private final DatagramSocket socket;
+    private final DatagramSocket serverSocket;
     private volatile boolean running;
     private final Thread receiveThread;
-    private ConcurrentHashMap<String, TCPStateMachine> clientStates = new ConcurrentHashMap<>();
+    private final TCPConnectionManager connectionManager;
+    private final byte[] receiveBuffer = new byte[1024];
+    private final int port;
 
     public ReliableUDPServer(int port) throws IOException {
         try {
-            this.socket = new DatagramSocket(port);
+            this.port = port;
+            this.serverSocket = new DatagramSocket(port);
             this.running = false;
             this.receiveThread = new Thread(this::receiveLoop);
+            this.connectionManager = new TCPConnectionManager(100, 50); // 最大半连接队列100，最大全连接队列50
         } catch (Exception e) {
             System.err.println("创建服务器失败: " + e.getMessage());
             e.printStackTrace();
@@ -31,7 +37,7 @@ public class ReliableUDPServer {
         try {
             running = true;
             receiveThread.start();
-            System.out.println("服务器启动在端口: " + socket.getLocalPort());
+            System.out.println("服务器启动在端口: " + serverSocket.getLocalPort());
         } catch (Exception e) {
             System.err.println("启动服务器失败: " + e.getMessage());
             e.printStackTrace();
@@ -42,107 +48,70 @@ public class ReliableUDPServer {
      * 停止服务器
      */
     public void stop() {
-        try {
-            running = false;
-            receiveThread.interrupt();
-            socket.close();
-        } catch (Exception e) {
-            System.err.println("停止服务器失败: " + e.getMessage());
-            e.printStackTrace();
-        }
+        running = false;
+        receiveThread.interrupt();
+        serverSocket.close();
     }
 
     /**
      * 接收循环
      */
     private void receiveLoop() {
-        byte[] buffer = new byte[1024];
-        DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
-
-        while (!Thread.currentThread().isInterrupted()) {
+        while (running) {
             try {
-                socket.receive(packet);
+                // 接收数据包
+                DatagramPacket packet = new DatagramPacket(receiveBuffer, receiveBuffer.length);
+                serverSocket.receive(packet);
 
-                // 解析数据包
-                byte[] actualData = new byte[packet.getLength()];
-                System.arraycopy(packet.getData(), 0, actualData, 0, packet.getLength());
-                Packet receivedPacket = Packet.fromBytes(actualData);
+                // 获取客户端信息
+                String clientIP = packet.getAddress().getHostAddress();
+                int clientPort = packet.getPort();
 
-                // 打印接收到的数据包
-                //System.out.println("收到数据包: " + receivedPacket);
+                // 获取或创建连接
+                String connectionKey = clientIP + ":" + clientPort;
+                BaseConnection connection = connectionManager.getConnection(connectionKey);
+                
+                if (connection == null) {
+                    // 检查是否已经在半连接队列中
+                    RequestSock requestSock = connectionManager.findRequestInSynQueue(clientIP, clientPort);
+                    
+                    if (requestSock == null) {
+                        // 创建新的连接请求
+                        requestSock = new RequestSock(
+                            clientIP,
+                            clientPort,
+                            port,
+                            (int)System.currentTimeMillis() // 简单的序列号生成
+                        );
+                        requestSock.setSocket(serverSocket);
+                        connectionManager.addToSynQueue(requestSock);
+                        requestSock.setState(State.LISTEN);
+                    }
 
-                // 处理新的客户端连接
-                if (receivedPacket.isSYN()) {
-                    handleNewClient(packet.getAddress(), packet.getPort(), receivedPacket);
+                    // 处理数据包
+                    byte[] data = new byte[packet.getLength()];
+                    System.arraycopy(packet.getData(), packet.getOffset(), data, 0, packet.getLength());
+                    Packet tcpPacket = Packet.fromBytes(data);
+
+                    requestSock.getTcpStateMachine().handlePacket(tcpPacket, requestSock);
+
+
+                    if (requestSock.state == State.ESTABLISHED) {
+                        connectionManager.moveToAcceptQueue(requestSock);
+                        TCPConnection newConnection = requestSock.promoteToFullConnection();
+                        connectionManager.putConnection(connectionKey, newConnection);
+                    }
+                } else {
+                    // 处理现有连接的数据
+                    byte[] data = new byte[packet.getLength()];
+                    System.arraycopy(packet.getData(), packet.getOffset(), data, 0, packet.getLength());
+                    Packet tcpPacket = Packet.fromBytes(data);
+                    connection.getTcpStateMachine().handlePacket(tcpPacket, connection);
                 }
-
-                TCPStateMachine tcpStateMachine = clientStates.get(getClientKey(packet.getAddress(), packet.getPort()));
-                tcpStateMachine.handlePacket(receivedPacket);
-
-                // 重置缓冲区
-                packet.setLength(buffer.length);
             } catch (IOException e) {
-                System.err.println("接收数据包失败: " + e.getMessage());
-                e.printStackTrace();
-            }
-        }
-    }
-
-    /**
-     * 处理新的客户端连接
-     */
-    private void handleNewClient(InetAddress clientAddress, int clientPort, Packet synPacket) {
-        try {
-            // 创建新的TCP状态机
-            TCPStateMachine tcpStateMachine = new TCPStateMachine(
-                socket,
-                clientAddress,
-                clientPort,
-                socket.getLocalPort()
-            );
-            // 设置状态为LISTEN
-            tcpStateMachine.setState(State.LISTEN);
-            // 保存状态机
-            clientStates.put(getClientKey(clientAddress, clientPort), tcpStateMachine);
-
-        } catch (Exception e) {
-            System.err.println("处理新客户端连接失败: " + e.getMessage());
-        }
-    }
-
-    /**
-     * 发送数据到指定客户端
-     */
-    public void sendToClient(InetAddress clientAddress, int clientPort, byte[] data) throws IOException {
-        String clientKey = getClientKey(clientAddress, clientPort);
-        TCPStateMachine tcpStateMachine = clientStates.get(clientKey);
-        if (tcpStateMachine != null) {
-            tcpStateMachine.send(data, true);  // 设置PUSH标志
-        } else {
-            throw new IOException("Client not connected");
-        }
-    }
-
-    private String getClientKey(InetAddress clientAddress, int clientPort) {
-        return clientAddress.getHostAddress() + ":" + clientPort;
-    }
-
-
-    public static void main(String[] args) {
-        ReliableUDPServer server = null;
-        try {
-            server = new ReliableUDPServer(12345);
-            server.start();
-
-            // 等待用户输入来停止服务器
-            System.out.println("按回车键停止服务器...");
-            System.in.read();
-        } catch (Exception e) {
-            System.err.println("服务器错误: " + e.getMessage());
-            e.printStackTrace();
-        } finally {
-            if (server != null) {
-                server.stop();
+                if (running) {
+                    System.err.println("接收数据失败: " + e.getMessage());
+                }
             }
         }
     }

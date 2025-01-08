@@ -5,12 +5,13 @@ import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
+import com.reliableudp.TCPConnectionManager.BaseConnection;
+import com.reliableudp.TCPConnectionManager.RequestSock;
+import com.reliableudp.TCPConnectionManager.TCPConnection;
 import com.reliableudp.TCPSendBuffer.SendData;
 
 /**
@@ -41,19 +42,7 @@ public class TCPStateMachine {
     private static final long MSL = 2000; // Maximum Segment Lifetime (2秒)
     private static final int MAX_DELAY = 3000;       // 最大延迟3秒
 
-    // 状态变量
-    private final DatagramSocket socket;
-    private final InetAddress peerAddress;
-    private final int peerPort;
-    private final int localPort;
-    private final TCPSendBuffer sendBuffer;
-    private final TCPReceiveBuffer receiveBuffer;
-    private final ScheduledExecutorService scheduler;
-    private final Map<Integer, ScheduledFuture<?>> retransmissionTimers;
-    private final Map<Integer, Long> sendTimes;
-    private State state;
     private int RTO = 1000;  // 初始重传超时时间为1秒
-    private ScheduledFuture<?> timeWaitTimer;
 
     // 重传相关
     private static final double ALPHA = 0.125;  // RTT平滑因子
@@ -62,140 +51,147 @@ public class TCPStateMachine {
     private double devRTT = 0;
 
     /**
-     * 创建TCP状态机
-     */
-    public TCPStateMachine(DatagramSocket socket, InetAddress peerAddress, int peerPort, int localPort) {
-        this.socket = socket;
-        this.peerAddress = peerAddress;
-        this.peerPort = peerPort;
-        this.localPort = localPort;
-        
-        // 初始化接收缓冲区
-        this.receiveBuffer = new TCPReceiveBuffer(1024, this::handleData);  // 添加窗口大小和数据处理回调
-        
-        // 初始化发送缓冲区
-        this.sendBuffer = new TCPSendBuffer(this::sendData);
-        
-        // 初始化状态和定时器
-        this.state = State.CLOSED;
-        this.scheduler = Executors.newScheduledThreadPool(1);
-        this.retransmissionTimers = new ConcurrentHashMap<>();
-        this.sendTimes = new ConcurrentHashMap<>();
-    }
-
-
-    public void setState(State state) {
-        this.state = state;
-    }
-
-    /**
      * 处理接收到的数据包
      */
-    public synchronized void handlePacket(Packet packet) {
+    public synchronized void handlePacket(Packet packet, BaseConnection connection) {
         try {
             System.out.println("\n");
             System.out.println("================================");
-            System.out.println("接收数据包前状态: " + state + ", 收到数据包: " + packet);
+
+            // 对于三次握手阶段的包（SYN, SYN-ACK, 第一个ACK），使用RequestSock处理
+            if (connection instanceof RequestSock) {
+                RequestSock requestSock = (TCPConnectionManager.RequestSock)connection;
+                switch (requestSock.getState()) {
+                    case LISTEN:
+                        handleListenState(requestSock, packet);
+                        break;
+                    case SYN_SENT:
+                        handleSynSentState(requestSock, packet);
+                        break;
+                    case SYN_RECEIVED:
+                        handleSynReceivedState(requestSock, packet);
+                        break;
+                    default:
+                        System.err.println("未知状态: " + requestSock.getState());
+                }
+                return;
+            }
+
+            // 对于已建立连接的包，使用TCPConnection处理
+            TCPConnection tcpConnection = (TCPConnection)connection;
+            System.out.println("接收数据包前状态: " + tcpConnection.getState() + ", 收到数据包: " + packet);
             System.out.println("接收数据包前的缓冲区状态:");
-            System.out.println("  " + sendBuffer);
-            System.out.println("  " + receiveBuffer);
+            System.out.println("  " + tcpConnection.getSendBuffer());
+            System.out.println("  " + tcpConnection.getReceiveBuffer());
 
             // 首先处理ACK，因为在任何状态下都可能收到ACK
             if (packet.isACK()) {
-                handleAck(packet);
+                handleAck(tcpConnection, packet);
             }
 
             // 然后根据当前状态处理其他类型的包
+            State state = tcpConnection.getState();
             switch (state) {
-                case CLOSED:
-                    handleClosedState(packet);
-                    break;
-                case LISTEN:
-                    handleListenState(packet);
-                    break;
-                case SYN_SENT:
-                    handleSynSentState(packet);
-                    break;
-                case SYN_RECEIVED:
-                    handleSynReceivedState(packet);
-                    break;
                 case ESTABLISHED:
-                    handleEstablishedState(packet);
+                    handleEstablishedState(tcpConnection, packet);
                     break;
                 case FIN_WAIT_1:
-                    handleFinWait1State(packet);
+                    handleFinWait1State(tcpConnection, packet);
                     break;
                 case FIN_WAIT_2:
-                    handleFinWait2State(packet);
+                    handleFinWait2State(tcpConnection, packet);
                     break;
                 case CLOSE_WAIT:
-                    handleCloseWaitState(packet);
+                    handleCloseWaitState(tcpConnection, packet);
                     break;
                 case LAST_ACK:
-                    handleLastAckState(packet);
+                    handleLastAckState(tcpConnection, packet);
                     break;
                 case CLOSING:
-                    handleClosingState(packet);
+                    handleClosingState(tcpConnection, packet);
                     break;
                 case TIME_WAIT:
-                    handleTimeWaitState(packet);
+                    handleTimeWaitState(tcpConnection, packet);
                     break;
+                default:
+                    System.err.println("未知状态: " + state);
             }
-        } catch (IOException e) {
+
+        } catch (Exception e) {
             System.err.println("处理数据包时发生错误: " + e.getMessage());
             e.printStackTrace();
         }
+    }
 
-        System.out.println("接收数据包后状态: " + state + ", 收到数据包: " + packet);
-        System.out.println("接收数据包后的缓冲区状态:");
-        System.out.println("  " + sendBuffer);
-        System.out.println("  " + receiveBuffer);
-        System.out.println("================================");
-        System.out.println("\n");
+    /**
+     * 发送SYN-ACK包
+     */
+    private void sendSynAck(TCPConnectionManager.RequestSock requestSock, Packet packet) {
+        // 创建并发送SYN-ACK包
+        Packet synAckPacket = Packet.createSynAck(
+            requestSock.getSourcePort(),
+            requestSock.getPeerPort(),
+            requestSock.getSndSeq(),
+            requestSock.getRcvSeq(),
+            WINDOW_SIZE
+        );
+        // 发送SYN-ACK包
+        try {
+            byte[] data = synAckPacket.toBytes();
+            DatagramPacket datagramPacket = new DatagramPacket(
+                data,
+                data.length,
+                InetAddress.getByName(requestSock.getPeerAddress()),
+                requestSock.getPeerPort()
+            );
+            requestSock.getSocket().send(datagramPacket);
+        } catch (IOException e) {
+            System.err.println("发送SYN-ACK包失败: " + e.getMessage());
+        }
     }
 
     /**
      * 发送数据
      */
-    public void send(byte[] data, boolean push) throws IOException {
-        if (state != State.ESTABLISHED) {
+    public void send(TCPConnection connection, byte[] data, boolean push) throws IOException {
+        if (connection.getState() != State.ESTABLISHED) {
             throw new IOException("Connection not established");
         }
+        TCPSendBuffer sendBuffer = connection.getSendBuffer();
         sendBuffer.writeToBuffer(data, push);
     }
 
     /**
      * 关闭连接
      */
-    public void close() throws IOException {
-        if (state == State.ESTABLISHED) {
-            sendFin();
-            state = State.FIN_WAIT_1;
+    public void close(TCPConnection connection) throws IOException {
+        if (connection.getState() == State.ESTABLISHED) {
+            sendFin(connection);
+            connection.setState(State.FIN_WAIT_1);
         }
     }
-
 
     /**
      * 发送数据包，并处理重传
      * @param packet 要发送的数据包
      * @param isRetransmission 是否是重传
      */
-    private void sendWithRetransmission(Packet packet, boolean isRetransmission) {
+    private void sendWithRetransmission(TCPConnection connection, Packet packet, boolean isRetransmission) {
 
         try {
             // 序列化并发送数据包
             byte[] data = packet.toBytes();
             DatagramPacket datagramPacket = new DatagramPacket(
-                data, 
-                data.length, 
-                peerAddress, 
-                peerPort
+                data,
+                data.length,
+                InetAddress.getByName(connection.getPeerAddress()),
+                connection.getPeerPort()
             );
-            socket.send(datagramPacket);
+            connection.getSocket().send(datagramPacket);
 
             // 如果不是重传，则启动重传定时器
             if (!isRetransmission) {
-                startRetransmissionTimer(packet);
+                startRetransmissionTimer(connection, packet);
             }
         } catch (IOException e) {
             e.printStackTrace();
@@ -205,43 +201,62 @@ public class TCPStateMachine {
     /**
      * 发送确认包
      */
-    private void sendAck(int ackNum) {
+    private void sendAck(TCPConnection connection, int ackNum) {
+        TCPSendBuffer sendBuffer = connection.getSendBuffer();
+        TCPReceiveBuffer receiveBuffer = connection.getReceiveBuffer();
         Packet ack = Packet.createAck(
-            localPort,
-            peerPort,
+            connection.getSourcePort(),
+            connection.getPeerPort(),
             sendBuffer.getSndNxt(),
             ackNum,
             receiveBuffer.getRcvWnd()
         );
-        sendWithRetransmission(ack, true);
+        sendWithRetransmission(connection, ack, true);
     }
 
     /**
      * 发送SYN包
      */
-    private void sendSyn() throws IOException {
-        if (state == State.CLOSED) {
-            Packet synPacket = Packet.createSyn(localPort, peerPort, sendBuffer.getSndUna(), receiveBuffer.getRcvWnd());
-            sendBuffer.updateSndNxt(synPacket.getSeqNum() + 1);
-            sendWithRetransmission(synPacket, false);
-            state = State.SYN_SENT;
+    private void sendSyn(RequestSock requestSock) throws IOException {
+        // 创建并发送SYN包
+        Packet synAckPacket = Packet.createSyn(
+            requestSock.getSourcePort(),
+            requestSock.getPeerPort(),
+            requestSock.getSndSeq(),
+            WINDOW_SIZE
+        );
+
+        // 发送ACK包
+        try {
+            byte[] data = synAckPacket.toBytes();
+            DatagramPacket datagramPacket = new DatagramPacket(
+                data,
+                data.length,
+                InetAddress.getByName(requestSock.getPeerAddress()),
+                requestSock.getPeerPort()
+            );
+            requestSock.getSocket().send(datagramPacket);
+        } catch (IOException e) {
+            System.err.println("发送SYN包失败: " + e.getMessage());
         }
     }
 
-    private void sendData(Boolean force) {
-        if (state == State.ESTABLISHED) {
+    public void sendData(TCPConnection connection, Boolean force) {
+        if (connection.getState() == State.ESTABLISHED) {
+            TCPSendBuffer sendBuffer = connection.getSendBuffer();
+            TCPReceiveBuffer receiveBuffer = connection.getReceiveBuffer();
             SendData nextData = sendBuffer.getNextData();
             if (nextData != null) {
                 Packet dataPacket = Packet.createData(
-                    localPort, 
-                    peerPort, 
-                    nextData.getSeqNum(), 
+                    connection.getSourcePort(),
+                    connection.getPeerPort(),
+                    nextData.getSeqNum(),
                     receiveBuffer.getRcvNxt(),
                     nextData.getData(),
-                    sendBuffer.getSnd_wnd(), 
+                    sendBuffer.getSnd_wnd(),
                     force || nextData.isForce()  // 使用force参数或SendData中的force标志
                 );
-                sendWithRetransmission(dataPacket, false);
+                sendWithRetransmission(connection, dataPacket, false);
             }
         }
     }
@@ -249,58 +264,47 @@ public class TCPStateMachine {
     /**
      * 发送FIN包
      */
-    private void sendFin() {
+    private void sendFin(TCPConnection connection) {
+        TCPSendBuffer sendBuffer = connection.getSendBuffer();
+        TCPReceiveBuffer receiveBuffer = connection.getReceiveBuffer();
         Packet fin = Packet.createFin(
-            localPort,
-            peerPort,
+            connection.getSourcePort(),
+            connection.getPeerPort(),
             sendBuffer.getSndNxt(),
             receiveBuffer.getRcvNxt(),
             receiveBuffer.getRcvWnd()
         );
         sendBuffer.updateSndNxt(fin.getSeqNum() + 1);
-        sendWithRetransmission(fin, false);
-        state = State.FIN_WAIT_1;
+        sendWithRetransmission(connection, fin, false);
+        connection.setState(State.FIN_WAIT_1);
     }
 
     /**
-     * 发送SYN-ACK包
+     * 处理收到的数据包
      */
-    private void sendSynAck(Packet packet) {
-        Packet synAck = Packet.createSynAck(
-            localPort,
-            peerPort,
-            sendBuffer.getSndNxt(),
-            packet.getSeqNum() + 1,
-            receiveBuffer.getRcvWnd()
-        );
-        sendBuffer.updateSndNxt(synAck.getSeqNum() + 1);
-        sendWithRetransmission(synAck, false);
-    }
-
-    /**
-     * 处理收到的ACK包
-     */
-    private void handleAck(Packet packet) {
+    private void handleAck(TCPConnection connection, Packet packet) {
         if (packet.isACK()) {
             System.out.println("收到ACK包: ackNum=" + packet.getAckNum() + ", windowSize=" + packet.getWindowSize());
-            
+
+            TCPSendBuffer sendBuffer = connection.getSendBuffer();
+            TCPReceiveBuffer receiveBuffer = connection.getReceiveBuffer();
             // 更新发送缓冲区的确认状态
             sendBuffer.handleAck(packet.getAckNum());
-            
+
             // 更新对方的接收窗口大小
             sendBuffer.updateReceiveWindow(packet.getWindowSize());
 
             // 如果所有数据都已确认，取消重传定时器
             if (sendBuffer.allDataAcked()) {
                 System.out.println("所有数据已确认，取消重传定时器");
-                cancelRetransmissionTimer();
+                cancelRetransmissionTimer(connection);
             } else {
                 // 取消已确认数据的重传定时器
-                cancelRetransmissionTimer(packet.getAckNum() - 1);
+                cancelRetransmissionTimer(connection, packet.getAckNum() - 1);
             }
-            
+
             // 更新RTT和RTO
-            Long sendTime = sendTimes.remove(packet.getAckNum() - 1);
+            Long sendTime = connection.getSendTimes().remove(packet.getAckNum() - 1);
             if (sendTime != null) {
                 long sampleRTT = System.currentTimeMillis() - sendTime;
                 if (estimatedRTT == 0) {
@@ -310,36 +314,28 @@ public class TCPStateMachine {
                     estimatedRTT = (1 - ALPHA) * estimatedRTT + ALPHA * sampleRTT;
                     devRTT = (1 - BETA) * devRTT + BETA * Math.abs(sampleRTT - estimatedRTT);
                 }
-                RTO = (int) (estimatedRTT + 4 * devRTT);
-                System.out.println("更新RTO: sampleRTT=" + sampleRTT + "ms, estimatedRTT=" + estimatedRTT + "ms, devRTT=" + devRTT + "ms, newRTO=" + RTO + "ms");
+                RTO = (int)(estimatedRTT + 4 * devRTT);
+                System.out.println(
+                    "更新RTO: sampleRTT=" + sampleRTT + "ms, estimatedRTT=" + estimatedRTT + "ms, devRTT=" + devRTT
+                        + "ms, newRTO=" + RTO + "ms");
             }
         }
     }
 
-    /**
-     * 处理CLOSED状态下收到的数据包
-     */
-    private void handleClosedState(Packet packet) throws IOException {
-        // CLOSED状态只处理主动打开的情况
-        if (packet.isSYN()) {
-            // 作为客户端，发起连接
-            sendSyn();
-        }
-    }
 
     /**
      * 处理LISTEN状态下收到的数据包
      */
-    private void handleListenState(Packet packet) throws IOException {
+    private void handleListenState(RequestSock connection, Packet packet) throws IOException {
         if (packet.isSYN()) {
             // 收到SYN包，进入SYN_RECEIVED状态
-            state = State.SYN_RECEIVED;
-            
-            //更新接收缓存区
-            receiveBuffer.setInitialSequenceNumber(packet.getSeqNum());
+            connection.setState(State.SYN_RECEIVED);
+
+            // 更新接收序号
+            connection.setRcvSeq(packet.getSeqNum() + 1);
 
             // 发送SYN+ACK包
-            sendSynAck(packet);
+            sendSynAck(connection, packet);
         }
 
     }
@@ -347,52 +343,72 @@ public class TCPStateMachine {
     /**
      * 处理SYN_SENT状态下收到的数据包
      */
-    private void handleSynSentState(Packet packet) throws IOException {
+    private void handleSynSentState(RequestSock requestSock, Packet packet) throws IOException {
         if (packet.isSYN() && packet.isACK()) {
             // 收到SYN+ACK包，进入ESTABLISHED状态
-            state = State.ESTABLISHED;
+            requestSock.setState(State.ESTABLISHED);
 
-            // 设置接收缓冲区的初始序列号
-            receiveBuffer.setInitialSequenceNumber(packet.getSeqNum());
+            //更新接收序号和发送序号
+            requestSock.setRcvSeq(packet.getSeqNum() + 1);
+            requestSock.setSndSeq(requestSock.getSndSeq() + 1);
+
+            // 创建并发送ACK包
+            Packet synAckPacket = Packet.createAck(
+                requestSock.getSourcePort(),
+                requestSock.getPeerPort(),
+                requestSock.getSndSeq(),
+                requestSock.getRcvSeq(),
+                WINDOW_SIZE
+            );
 
             // 发送ACK包
-            sendAck(packet.getSeqNum() + 1);
+            try {
+                byte[] data = synAckPacket.toBytes();
+                DatagramPacket datagramPacket = new DatagramPacket(
+                    data,
+                    data.length,
+                    InetAddress.getByName(requestSock.getPeerAddress()),
+                    requestSock.getPeerPort()
+                );
+                requestSock.getSocket().send(datagramPacket);
+            } catch (IOException e) {
+                System.err.println("发送SYN-ACK包失败: " + e.getMessage());
+            }
         }
     }
 
     /**
      * 处理SYN_RECEIVED状态下收到的数据包
      */
-    private void handleSynReceivedState(Packet packet) throws IOException {
+    private void handleSynReceivedState(RequestSock connection, Packet packet) throws IOException {
         if (packet.isACK()) {
             // 收到ACK，进入ESTABLISHED状态
-            state = State.ESTABLISHED;
-
-            // 取消SYN-ACK包的重传
-            cancelRetransmissionTimer(sendBuffer.getSndUna());
+            connection.setState(State.ESTABLISHED);
+            connection.setRcvSeq(packet.getSeqNum() + 1);
         } else if (packet.isSYN()) {
             // 收到重复的SYN，重发SYN+ACK
-            sendSynAck(packet);
+            sendSynAck(connection, packet);
         }
     }
 
     /**
      * 处理ESTABLISHED状态下收到的数据包
      */
-    private void handleEstablishedState(Packet packet) throws IOException {
+    private void handleEstablishedState(TCPConnection connection, Packet packet) throws IOException {
         if (packet.isFIN()) {
             // 收到FIN包，进入CLOSE_WAIT状态
-            state = State.CLOSE_WAIT;
+            connection.setState(State.CLOSE_WAIT);
 
             // 发送ACK确认FIN
-            sendAck(packet.getSeqNum() + 1);
+            sendAck(connection, packet.getSeqNum() + 1);
         } else if (packet.getType() == Packet.TYPE_DATA) {
             // 处理数据包
+            TCPReceiveBuffer receiveBuffer = connection.getReceiveBuffer();
             int result = receiveBuffer.receive(packet.getSeqNum(), packet.getData());
 
             // 发送ACK
             if (result >= 0) {  // 成功接收或重复数据
-                sendAck(receiveBuffer.getRcvNxt());
+                sendAck(connection, receiveBuffer.getRcvNxt());
             }
         }
     }
@@ -400,160 +416,126 @@ public class TCPStateMachine {
     /**
      * 处理FIN_WAIT1状态下收到的数据包
      */
-    private void handleFinWait1State(Packet packet) throws IOException {
+    private void handleFinWait1State(TCPConnection connection, Packet packet) throws IOException {
+        TCPSendBuffer sendBuffer = connection.getSendBuffer();
         if (packet.isACK() && packet.getAckNum() == sendBuffer.getSndNxt()) {
             // 收到ACK，进入FIN_WAIT2状态
-            state = State.FIN_WAIT_2;
+            connection.setState(State.FIN_WAIT_2);
         } else if (packet.isFIN()) {
             // 收到FIN，进入CLOSING状态
-            state = State.CLOSING;
+            connection.setState(State.CLOSING);
 
             // 发送ACK确认FIN
-            sendAck(packet.getSeqNum() + 1);
+            sendAck(connection, packet.getSeqNum() + 1);
         }
     }
 
     /**
      * 处理FIN_WAIT2状态下收到的数据包
      */
-    private void handleFinWait2State(Packet packet) throws IOException {
+    private void handleFinWait2State(TCPConnection connection, Packet packet) throws IOException {
         if (packet.isFIN()) {
             // 收到FIN，进入TIME_WAIT状态
-            state = State.TIME_WAIT;
+            connection.setState(State.TIME_WAIT);
 
             // 发送ACK确认FIN
-            sendAck(packet.getSeqNum() + 1);
+            sendAck(connection, packet.getSeqNum() + 1);
 
             // 启动TIME_WAIT定时器
-            startTimeWaitTimer();
+            startTimeWaitTimer(connection);
         }
     }
 
     /**
      * 处理CLOSE_WAIT状态下收到的数据包
      */
-    private void handleCloseWaitState(Packet packet) throws IOException {
+    private void handleCloseWaitState(TCPConnection connection, Packet packet) throws IOException {
         // CLOSE_WAIT状态主要等待应用层关闭连接
         // 可以处理重复的FIN包
         if (packet.isFIN()) {
             // 重发ACK
-            sendAck(packet.getSeqNum() + 1);
+            sendAck(connection, packet.getSeqNum() + 1);
         }
     }
 
     /**
      * 处理LAST_ACK状态下收到的数据包
      */
-    private void handleLastAckState(Packet packet) throws IOException {
+    private void handleLastAckState(TCPConnection connection, Packet packet) throws IOException {
+        TCPSendBuffer sendBuffer = connection.getSendBuffer();
         if (packet.isACK() && packet.getAckNum() == sendBuffer.getSndNxt()) {
             // 收到最后的ACK，进入CLOSED状态
-            state = State.CLOSED;
+            connection.setState(State.CLOSED);
         }
     }
 
     /**
      * 处理CLOSING状态下收到的数据包
      */
-    private void handleClosingState(Packet packet) throws IOException {
+    private void handleClosingState(TCPConnection connection, Packet packet) throws IOException {
+        TCPSendBuffer sendBuffer = connection.getSendBuffer();
         if (packet.isACK() && packet.getAckNum() == sendBuffer.getSndNxt()) {
             // 收到ACK，进入TIME_WAIT状态
-            state = State.TIME_WAIT;
+            connection.setState(State.TIME_WAIT);
 
             // 启动TIME_WAIT定时器
-            startTimeWaitTimer();
+            startTimeWaitTimer(connection);
         }
     }
 
     /**
      * 处理TIME_WAIT状态下收到的数据包
      */
-    private void handleTimeWaitState(Packet packet) throws IOException {
+    private void handleTimeWaitState(TCPConnection connection, Packet packet) throws IOException {
         if (packet.isFIN()) {
             // 收到重复的FIN，重发ACK
-            sendAck(packet.getSeqNum() + 1);
+            sendAck(connection, packet.getSeqNum() + 1);
 
             // 重置TIME_WAIT定时器
-            startTimeWaitTimer();
+            startTimeWaitTimer(connection);
         }
     }
 
     /**
      * 启动TIME_WAIT定时器
      */
-    private void startTimeWaitTimer() {
+    private void startTimeWaitTimer(TCPConnection connection) {
+        ScheduledFuture<?> timeWaitTimer = connection.getTimeWaitTimer();
         if (timeWaitTimer != null) {
             timeWaitTimer.cancel(false);
         }
 
-        timeWaitTimer = scheduler.schedule(() -> {
-            state = State.CLOSED;
-            cleanup();
-        }, 2 * MSL, TimeUnit.MILLISECONDS);
+        connection.setTimeWaitTimer(connection.getScheduler().schedule(() -> {
+            connection.setState(State.CLOSED);
+            cleanup(connection);
+        }, 2 * MSL, TimeUnit.MILLISECONDS));
     }
 
     /**
      * 清理资源
      */
-    private void cleanup() {
+    private void cleanup(TCPConnection connection) {
         // 取消所有定时器
+        Map<Integer, ScheduledFuture<?>> retransmissionTimers = connection.getRetransmissionTimers();
         for (ScheduledFuture<?> timer : retransmissionTimers.values()) {
             timer.cancel(false);
         }
         retransmissionTimers.clear();
 
+        ScheduledFuture<?> timeWaitTimer = connection.getTimeWaitTimer();
         if (timeWaitTimer != null) {
             timeWaitTimer.cancel(false);
-            timeWaitTimer = null;
+            connection.setTimeWaitTimer(null);
         }
 
         // 清理数据结构
-        sendTimes.clear();
-    }
-
-    /**
-     * 获取当前状态
-     */
-    public State getState() {
-        return state;
-    }
-
-    /**
-     * 获取发送缓冲区
-     */
-    public TCPSendBuffer getSendBuffer() {
-        return sendBuffer;
-    }
-
-    /**
-     * 获取接收缓冲区
-     */
-    public TCPReceiveBuffer getReceiveBuffer() {
-        return receiveBuffer;
-    }
-
-    /**
-     * 主动建立连接
-     *
-
-    /**
-     * 主动关闭连接
-     */
-    public void disconnect() throws IOException {
-        if (state != State.ESTABLISHED && state != State.CLOSE_WAIT) {
-            throw new IOException("状态错误: " + state);
-        }
-
-        // 发送FIN包
-        sendFin();
-
-        // 更新状态
-        state = (state == State.ESTABLISHED) ? State.FIN_WAIT_1 : State.LAST_ACK;
+        connection.getSendTimes().clear();
     }
 
     /**
      * 处理收到的数据
      */
-    private void handleData(byte[] data) {
+    public void handleData(byte[] data) {
         // 这里可以添加数据处理逻辑
         System.out.println("收到数据: " + new String(data));
     }
@@ -561,39 +543,42 @@ public class TCPStateMachine {
     /**
      * 发起连接
      */
-    public void connect() throws IOException {
-        if (state == State.CLOSED) {
-            sendSyn();
+    public void connect(RequestSock connection) throws IOException {
+        if (connection.getState() == State.CLOSED) {
+            connection.setState(State.SYN_SENT);
+            sendSyn(connection);
         }
     }
 
     /**
      * 检查连接状态
      */
-    public boolean isConnected() {
-        return state == State.ESTABLISHED;
+    public boolean isConnected(TCPConnection connection) {
+        return connection.getState() == State.ESTABLISHED;
     }
 
     /**
      * 设置重传定时器
      */
-    private void startRetransmissionTimer(Packet packet) {
+    private void startRetransmissionTimer(TCPConnection connection, Packet packet) {
         // 取消已有的定时器（如果存在）
-        cancelRetransmissionTimer(packet.getSeqNum());
+        cancelRetransmissionTimer(connection, packet.getSeqNum());
 
         // 创建新的重传任务
+        ScheduledExecutorService scheduler = connection.getScheduler();
         ScheduledFuture<?> timer = scheduler.schedule(() -> {
             try {
                 synchronized (this) {
                     System.out.println("开始重传数据包: seqNum=" + packet.getSeqNum() + ", RTO=" + RTO + "ms");
                     byte[] data = packet.toBytes();
+                    DatagramSocket socket = connection.getSocket();
                     socket.send(new java.net.DatagramPacket(
-                        data, data.length, peerAddress, peerPort
+                        data, data.length, InetAddress.getByName(connection.getPeerAddress()), connection.getPeerPort()
                     ));
                     // 指数退避：下次超时时间加倍
                     RTO *= 2;
                     System.out.println("重传完成，新的RTO=" + RTO + "ms");
-                    startRetransmissionTimer(packet);
+                    startRetransmissionTimer(connection, packet);
                 }
             } catch (Exception e) {
                 System.err.println("重传数据包失败: " + e.getMessage());
@@ -602,13 +587,15 @@ public class TCPStateMachine {
         }, RTO, TimeUnit.MILLISECONDS);
 
         System.out.println("设置重传定时器: seqNum=" + packet.getSeqNum() + ", RTO=" + RTO + "ms");
-        retransmissionTimers.put(packet.getSeqNum(), timer);
+
+        connection.getRetransmissionTimers().put(packet.getSeqNum(), timer);
     }
 
     /**
      * 取消重传定时器
      */
-    private void cancelRetransmissionTimer() {
+    private void cancelRetransmissionTimer(TCPConnection connection) {
+        Map<Integer, ScheduledFuture<?>> retransmissionTimers = connection.getRetransmissionTimers();
         System.out.println("取消所有重传定时器，数量: " + retransmissionTimers.size());
         for (ScheduledFuture<?> timer : retransmissionTimers.values()) {
             timer.cancel(false);
@@ -619,7 +606,8 @@ public class TCPStateMachine {
     /**
      * 取消重传定时器
      */
-    private void cancelRetransmissionTimer(int seqNum) {
+    private void cancelRetransmissionTimer(TCPConnection connection, int seqNum) {
+        Map<Integer, ScheduledFuture<?>> retransmissionTimers = connection.getRetransmissionTimers();
         ScheduledFuture<?> timer = retransmissionTimers.remove(seqNum);
         if (timer != null) {
             System.out.println("取消重传定时器: seqNum=" + seqNum);

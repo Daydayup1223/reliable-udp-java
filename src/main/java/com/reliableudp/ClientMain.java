@@ -42,7 +42,6 @@ public class ClientMain {
                 System.out.println("\n正在关闭客户端...");
                 try {
                     if (client != null) {
-                        client.disconnect();
                     }
                 } catch (Exception e) {
                     System.err.println("关闭时发生错误: " + e.getMessage());
@@ -67,7 +66,6 @@ public class ClientMain {
                         break;
                     case "4":
                         System.out.println("正在退出...");
-                        client.disconnect();
                         return;
                     default:
                         System.out.println("无效的选择，请重试");

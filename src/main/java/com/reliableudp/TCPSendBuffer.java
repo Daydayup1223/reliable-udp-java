@@ -66,12 +66,12 @@ public class TCPSendBuffer {
     private final Consumer<Boolean> packetSender;
     private ScheduledFuture<?> delayedSendTask;
     
-    public TCPSendBuffer(Consumer<Boolean> packetSender) {
+    public TCPSendBuffer(Consumer<Boolean> packetSender, int seq) {
         this.sendBuffer = new byte[BUFFER_SIZE];
         this.packetSender = packetSender;
         this.scheduler = Executors.newSingleThreadScheduledExecutor();
-        this.snd_una = 0;
-        this.snd_nxt = 0;
+        this.snd_una = seq;
+        this.snd_nxt = seq;
         this.cwnd = INIT_CWND;
         this.ssthresh = INIT_SSTHRESH;
         this.rwnd = 65535;
