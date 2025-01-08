@@ -226,7 +226,7 @@ public class TCPStateMachine {
             WINDOW_SIZE
         );
 
-        // 发送ACK包
+        // 发送SYN包
         try {
             byte[] data = synAckPacket.toBytes();
             DatagramPacket datagramPacket = new DatagramPacket(
@@ -350,7 +350,7 @@ public class TCPStateMachine {
 
             //更新接收序号和发送序号
             requestSock.setRcvSeq(packet.getSeqNum() + 1);
-            requestSock.setSndSeq(requestSock.getSndSeq() + 1);
+            requestSock.setSndSeq(packet.getAckNum());
 
             // 创建并发送ACK包
             Packet synAckPacket = Packet.createAck(
@@ -384,7 +384,7 @@ public class TCPStateMachine {
         if (packet.isACK()) {
             // 收到ACK，进入ESTABLISHED状态
             connection.setState(State.ESTABLISHED);
-            connection.setRcvSeq(packet.getSeqNum() + 1);
+            connection.setSndSeq(packet.getAckNum());
         } else if (packet.isSYN()) {
             // 收到重复的SYN，重发SYN+ACK
             sendSynAck(connection, packet);
